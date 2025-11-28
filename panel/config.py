@@ -1,0 +1,31 @@
+"""
+Bot Panel Configuration using Environment Variables
+"""
+
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Bot settings
+BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+
+# Admin users (Telegram user IDs)
+ADMIN_USERS_STR = os.getenv('ADMIN_USERS', '')
+ADMIN_USERS = [int(user_id.strip()) for user_id in ADMIN_USERS_STR.split(',') if user_id.strip()]
+
+# UI Settings
+PAGE_SIZE = int(os.getenv('PAGE_SIZE', '5'))
+MAX_GROUPS_PER_BULK = int(os.getenv('MAX_GROUPS_PER_BULK', '10'))
+
+# Operation Limits for Bot
+BOT_MAX_CONCURRENT_SCRAPES = int(os.getenv('BOT_MAX_CONCURRENT_SCRAPES', '3'))
+BOT_REQUEST_TIMEOUT = int(os.getenv('BOT_REQUEST_TIMEOUT', '30'))
+
+# Validation
+if not BOT_TOKEN or BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
+    raise ValueError("BOT_TOKEN must be set in .env file")
+
+if not ADMIN_USERS:
+    raise ValueError("ADMIN_USERS must be set in .env file")

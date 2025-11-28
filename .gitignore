@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables
+.env
+
+# Telegram session files
+*.session
+sessions/*.session
+test.session
+
+# Data files
+data/
+*.csv
+*.db
+sessions/data.db
+sessions/passwords.txt
+sessions/corrupted.csv
+
+# Testing
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Kiro (keep specs but ignore other generated files)
+.kiro/*
+.kiro/cache/
+.kiro/logs/
