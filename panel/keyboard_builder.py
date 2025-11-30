@@ -16,6 +16,7 @@ from .persian_text import (
     BTN_LIST_SESSIONS, BTN_SESSION_DETAILS, BTN_DAILY_STATS, BTN_HEALTH_STATUS,
     BTN_LOAD_DISTRIBUTION
 )
+from .navigation import get_navigation_manager
 
 
 class KeyboardBuilder:
@@ -41,8 +42,12 @@ class KeyboardBuilder:
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
-    def scrape_menu() -> InlineKeyboardMarkup:
-        """Build scraping menu keyboard"""
+    def scrape_menu(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+        """
+        Build scraping menu keyboard with consistent navigation
+        
+        Requirements: AC-6.6
+        """
         keyboard = [
             [
                 InlineKeyboardButton(BTN_SCRAPE_SINGLE, callback_data="scrape:single"),
@@ -51,17 +56,36 @@ class KeyboardBuilder:
             [
                 InlineKeyboardButton(BTN_EXTRACT_LINKS, callback_data="scrape:extract"),
                 InlineKeyboardButton(BTN_BATCH_SCRAPE, callback_data="scrape:batch")
-            ],
-            [
-                InlineKeyboardButton(BTN_BACK, callback_data="nav:main"),
-                InlineKeyboardButton(BTN_CANCEL, callback_data="action:cancel")
             ]
         ]
+        
+        # Add consistent navigation buttons
+        if user_id is not None:
+            nav_manager = get_navigation_manager()
+            keyboard = nav_manager.add_navigation_buttons(
+                keyboard=keyboard,
+                user_id=user_id,
+                include_back=True,
+                include_main=True,
+                include_cancel=False,
+                back_target="nav:main"
+            )
+        else:
+            # Fallback for backward compatibility
+            keyboard.append([
+                InlineKeyboardButton(BTN_BACK, callback_data="nav:main"),
+                InlineKeyboardButton(BTN_MAIN_MENU, callback_data="nav:main")
+            ])
+        
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
-    def send_menu() -> InlineKeyboardMarkup:
-        """Build sending menu keyboard"""
+    def send_menu(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+        """
+        Build sending menu keyboard with consistent navigation
+        
+        Requirements: AC-6.6
+        """
         keyboard = [
             [
                 InlineKeyboardButton(BTN_SEND_TEXT, callback_data="send:text"),
@@ -73,17 +97,36 @@ class KeyboardBuilder:
             ],
             [
                 InlineKeyboardButton(BTN_SEND_OPERATIONS, callback_data="send:operations")
-            ],
-            [
-                InlineKeyboardButton(BTN_BACK, callback_data="nav:main"),
-                InlineKeyboardButton(BTN_CANCEL, callback_data="action:cancel")
             ]
         ]
+        
+        # Add consistent navigation buttons
+        if user_id is not None:
+            nav_manager = get_navigation_manager()
+            keyboard = nav_manager.add_navigation_buttons(
+                keyboard=keyboard,
+                user_id=user_id,
+                include_back=True,
+                include_main=True,
+                include_cancel=False,
+                back_target="nav:main"
+            )
+        else:
+            # Fallback for backward compatibility
+            keyboard.append([
+                InlineKeyboardButton(BTN_BACK, callback_data="nav:main"),
+                InlineKeyboardButton(BTN_MAIN_MENU, callback_data="nav:main")
+            ])
+        
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
-    def monitor_menu() -> InlineKeyboardMarkup:
-        """Build monitoring menu keyboard"""
+    def monitor_menu(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+        """
+        Build monitoring menu keyboard with consistent navigation
+        
+        Requirements: AC-6.6
+        """
         keyboard = [
             [
                 InlineKeyboardButton(BTN_LIST_CHANNELS, callback_data="monitor:list"),
@@ -100,17 +143,36 @@ class KeyboardBuilder:
             [
                 InlineKeyboardButton(BTN_START_MONITORING, callback_data="monitor:start"),
                 InlineKeyboardButton(BTN_STOP_MONITORING, callback_data="monitor:stop")
-            ],
-            [
-                InlineKeyboardButton(BTN_BACK, callback_data="nav:main"),
-                InlineKeyboardButton(BTN_CANCEL, callback_data="action:cancel")
             ]
         ]
+        
+        # Add consistent navigation buttons
+        if user_id is not None:
+            nav_manager = get_navigation_manager()
+            keyboard = nav_manager.add_navigation_buttons(
+                keyboard=keyboard,
+                user_id=user_id,
+                include_back=True,
+                include_main=True,
+                include_cancel=False,
+                back_target="nav:main"
+            )
+        else:
+            # Fallback for backward compatibility
+            keyboard.append([
+                InlineKeyboardButton(BTN_BACK, callback_data="nav:main"),
+                InlineKeyboardButton(BTN_MAIN_MENU, callback_data="nav:main")
+            ])
+        
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
-    def session_menu() -> InlineKeyboardMarkup:
-        """Build session management menu keyboard"""
+    def session_menu(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+        """
+        Build session management menu keyboard with consistent navigation
+        
+        Requirements: AC-6.6
+        """
         keyboard = [
             [
                 InlineKeyboardButton(BTN_LIST_SESSIONS, callback_data="session:list"),
@@ -122,12 +184,27 @@ class KeyboardBuilder:
             ],
             [
                 InlineKeyboardButton(BTN_LOAD_DISTRIBUTION, callback_data="session:load")
-            ],
-            [
-                InlineKeyboardButton(BTN_BACK, callback_data="nav:main"),
-                InlineKeyboardButton(BTN_CANCEL, callback_data="action:cancel")
             ]
         ]
+        
+        # Add consistent navigation buttons
+        if user_id is not None:
+            nav_manager = get_navigation_manager()
+            keyboard = nav_manager.add_navigation_buttons(
+                keyboard=keyboard,
+                user_id=user_id,
+                include_back=True,
+                include_main=True,
+                include_cancel=False,
+                back_target="nav:main"
+            )
+        else:
+            # Fallback for backward compatibility
+            keyboard.append([
+                InlineKeyboardButton(BTN_BACK, callback_data="nav:main"),
+                InlineKeyboardButton(BTN_MAIN_MENU, callback_data="nav:main")
+            ])
+        
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
@@ -339,6 +416,24 @@ class KeyboardBuilder:
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
+    def retry_back(retry_data: str = "action:retry", back_data: str = "nav:main") -> InlineKeyboardMarkup:
+        """
+        Build retry/back buttons for error handling
+        
+        Requirements: AC-9.5
+        """
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 تلاش مجدد", callback_data=retry_data)
+            ],
+            [
+                InlineKeyboardButton(BTN_BACK, callback_data=back_data),
+                InlineKeyboardButton(BTN_MAIN_MENU, callback_data="nav:main")
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
     def session_list(sessions: List[Dict[str, Any]], page: int, total_pages: int) -> InlineKeyboardMarkup:
         """
         Build session list keyboard with pagination
@@ -465,6 +560,181 @@ class KeyboardBuilder:
         """Build back to main menu button"""
         keyboard = [
             [
+                InlineKeyboardButton(BTN_MAIN_MENU, callback_data="nav:main")
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
+    def with_navigation(
+        keyboard: List[List[InlineKeyboardButton]],
+        user_id: int,
+        include_back: bool = True,
+        include_main: bool = True,
+        include_cancel: bool = False,
+        back_target: Optional[str] = None,
+        cancel_target: str = "action:cancel"
+    ) -> InlineKeyboardMarkup:
+        """
+        Add navigation buttons to keyboard using NavigationManager
+        
+        Args:
+            keyboard: Existing keyboard layout
+            user_id: User ID for navigation state
+            include_back: Include back button
+            include_main: Include main menu button
+            include_cancel: Include cancel button
+            back_target: Override back target
+            cancel_target: Cancel callback data
+            
+        Returns:
+            InlineKeyboardMarkup with navigation buttons
+            
+        Requirements: AC-6.6
+        """
+        nav_manager = get_navigation_manager()
+        keyboard_with_nav = nav_manager.add_navigation_buttons(
+            keyboard=keyboard,
+            user_id=user_id,
+            include_back=include_back,
+            include_main=include_main,
+            include_cancel=include_cancel,
+            back_target=back_target,
+            cancel_target=cancel_target
+        )
+        return InlineKeyboardMarkup(keyboard_with_nav)
+    
+    @staticmethod
+    def navigation_only(
+        user_id: int,
+        include_back: bool = True,
+        include_main: bool = True,
+        include_cancel: bool = False,
+        back_target: Optional[str] = None,
+        cancel_target: str = "action:cancel"
+    ) -> InlineKeyboardMarkup:
+        """
+        Create keyboard with only navigation buttons
+        
+        Args:
+            user_id: User ID for navigation state
+            include_back: Include back button
+            include_main: Include main menu button
+            include_cancel: Include cancel button
+            back_target: Override back target
+            cancel_target: Cancel callback data
+            
+        Returns:
+            InlineKeyboardMarkup with navigation buttons only
+            
+        Requirements: AC-6.6
+        """
+        nav_manager = get_navigation_manager()
+        nav_row = nav_manager.build_navigation_row(
+            user_id=user_id,
+            include_back=include_back,
+            include_main=include_main,
+            include_cancel=include_cancel,
+            back_target=back_target,
+            cancel_target=cancel_target
+        )
+        return InlineKeyboardMarkup([nav_row]) if nav_row else InlineKeyboardMarkup([[]])
+    
+    @staticmethod
+    def operation_history_list(
+        operations: List[Dict[str, Any]],
+        page: int,
+        total_pages: int
+    ) -> InlineKeyboardMarkup:
+        """
+        Build operation history list keyboard with pagination
+        
+        Args:
+            operations: List of operation dicts with operation details
+            page: Current page (0-indexed)
+            total_pages: Total number of pages
+        
+        Returns:
+            InlineKeyboardMarkup with operation buttons and navigation
+            
+        Requirements: AC-6.7
+        """
+        keyboard = []
+        
+        # Add operation buttons (one per row)
+        for op in operations:
+            op_id = op.get('operation_id', 'unknown')
+            op_type = op.get('operation_type', 'unknown')
+            status = op.get('status', 'unknown')
+            
+            # Status icon
+            status_icons = {
+                'running': '⏳',
+                'completed': '✅',
+                'failed': '❌',
+                'cancelled': '⏸️'
+            }
+            status_icon = status_icons.get(status, '❓')
+            
+            # Format button text
+            button_text = f"{status_icon} {op_type} - {status}"
+            
+            keyboard.append([
+                InlineKeyboardButton(
+                    button_text,
+                    callback_data=f"operation:details:{op_id}"
+                )
+            ])
+        
+        # Add pagination controls
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(
+                BTN_PREV,
+                callback_data=f"operation:history:page:{page-1}"
+            ))
+        
+        if total_pages > 1:
+            nav_row.append(InlineKeyboardButton(
+                f"صفحه {page+1}/{total_pages}",
+                callback_data="nav:noop"
+            ))
+        
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(
+                BTN_NEXT,
+                callback_data=f"operation:history:page:{page+1}"
+            ))
+        
+        if nav_row:
+            keyboard.append(nav_row)
+        
+        # Add refresh and back buttons
+        keyboard.append([
+            InlineKeyboardButton("🔄 بروزرسانی", callback_data=f"operation:history:page:{page}"),
+            InlineKeyboardButton(BTN_BACK, callback_data="nav:main")
+        ])
+        
+        return InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
+    def operation_details(operation_id: str, page: int = 0) -> InlineKeyboardMarkup:
+        """
+        Build operation details keyboard
+        
+        Args:
+            operation_id: Operation ID
+            page: Page number to return to
+        
+        Returns:
+            InlineKeyboardMarkup with refresh and back buttons
+        """
+        keyboard = [
+            [
+                InlineKeyboardButton(BTN_REFRESH, callback_data=f"operation:details:{operation_id}")
+            ],
+            [
+                InlineKeyboardButton(BTN_BACK, callback_data=f"operation:history:page:{page}"),
                 InlineKeyboardButton(BTN_MAIN_MENU, callback_data="nav:main")
             ]
         ]

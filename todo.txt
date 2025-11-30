@@ -1,0 +1,7 @@
+i need a cli panel too 
+
+it shoulde load sessions then show a menu to add, delete, list, edit channels and their reaction lists
+
+and it shouldve got menu for scraping or setting message sending jobqueues for them 
+
+i said jobqueue becuse of tasks i need for run each 12 hour and scrape a channel as a لینک دونی then scrape the links 

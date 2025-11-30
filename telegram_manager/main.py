@@ -249,13 +249,6 @@ class TelegramManagerApp:
             link_channels, join_first, limit_messages, max_members
         )
 
-    async def bulk_scrape_groups(self, groups: List[str], join_first: bool = False, 
-                               max_members: int = 10000, enforce_daily_limits: bool = True) -> Dict[str, Dict]:
-        """
-        Scrape multiple groups with optional daily limits enforcement
-        """
-        return await self.manager.bulk_scrape_groups(groups, join_first, max_members, enforce_daily_limits)
-
     async def get_session_stats(self) -> Dict:
         """
         Get statistics for all sessions including daily usage

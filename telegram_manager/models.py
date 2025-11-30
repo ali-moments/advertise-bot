@@ -27,6 +27,7 @@ class MessageResult:
     session_used: str
     error: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
+    blacklisted: bool = False  # Whether recipient was skipped due to blacklist
 
 
 @dataclass
@@ -1022,6 +1023,309 @@ class ProgressTracker:
         """
         return self._progress_cache.get(operation_id)
 
+
+
+@dataclass
+class BlacklistEntry:
+    """
+    Represents a blacklisted user with metadata.
+    
+    This dataclass stores information about a user who has been added to
+    the blacklist, including when they were added, why, and which session
+    detected the block (if applicable).
+    
+    Attributes:
+        user_id: User identifier (username without @ or numeric user ID)
+        timestamp: Unix timestamp when the user was added to blacklist
+        reason: Reason for blacklisting. Common values:
+            - "block_detected": Automatic detection after failures
+            - "manual": Manual addition by administrator
+            - "spam": User flagged as spam
+            - "abusive_behavior": User flagged for abuse
+        session_name: Name of the session that detected the block
+            (e.g., "+1234567890"). None for manual additions.
+    
+    Example:
+        >>> entry = BlacklistEntry(
+        ...     user_id='user123',
+        ...     timestamp=time.time(),
+        ...     reason='block_detected',
+        ...     session_name='+1234567890'
+        ... )
+    """
+    user_id: str
+    timestamp: float
+    reason: str
+    session_name: Optional[str] = None
+
+
+class ErrorClassifier:
+    """
+    Classifies message delivery errors to distinguish blocks from temporary failures.
+    
+    This class provides static methods to classify Telegram API errors into three
+    categories: block errors (user has blocked us), temporary errors (network issues,
+    rate limits), and unknown errors (default to temporary to avoid false positives).
+    
+    The classification is used to determine whether a delivery failure should trigger
+    blacklist addition after consecutive failures.
+    
+    Error Categories:
+        Block Errors: Indicate the user has blocked the system
+            - USER_PRIVACY_RESTRICTED: User privacy settings prevent delivery
+            - USER_IS_BLOCKED: User has explicitly blocked the sender
+            - PEER_ID_INVALID: User ID is invalid or user has deleted account
+            - INPUT_USER_DEACTIVATED: User account is deactivated
+        
+        Temporary Errors: Indicate transient issues that may resolve
+            - FLOOD_WAIT: Rate limit exceeded, need to wait
+            - TIMEOUT: Network timeout
+            - CONNECTION: Connection issues
+            - NETWORK: Network-related errors
+            - SLOWMODE_WAIT: Channel slowmode restriction
+        
+        Unknown Errors: Any error not matching above patterns
+            - Treated as temporary to avoid false positives
+    
+    Usage:
+        >>> error = Exception("USER_IS_BLOCKED")
+        >>> classification = ErrorClassifier.classify_error(error)
+        >>> print(classification)  # "block"
+        >>> 
+        >>> is_block = ErrorClassifier.is_block_error(error)
+        >>> print(is_block)  # True
+    """
+    
+    # Error patterns that indicate user has blocked us
+    BLOCK_INDICATORS = [
+        'USER_PRIVACY_RESTRICTED',
+        'USER_IS_BLOCKED',
+        'PEER_ID_INVALID',
+        'INPUT_USER_DEACTIVATED'
+    ]
+    
+    # Error patterns that indicate temporary failures
+    TEMPORARY_INDICATORS = [
+        'FLOOD_WAIT',
+        'TIMEOUT',
+        'CONNECTION',
+        'NETWORK',
+        'SLOWMODE_WAIT'
+    ]
+    
+    @classmethod
+    def classify_error(cls, error: Exception) -> str:
+        """
+        Classify an error as 'block', 'temporary', or 'unknown'.
+        
+        Examines the error message to determine the type of failure. The
+        classification is used to decide whether to add a user to the
+        blacklist after consecutive failures.
+        
+        Classification Logic:
+            1. Check if error message contains any BLOCK_INDICATORS
+               → Return 'block'
+            2. Check if error message contains any TEMPORARY_INDICATORS
+               → Return 'temporary'
+            3. Otherwise → Return 'temporary' (default to avoid false positives)
+        
+        Args:
+            error: Exception from message send attempt. The error message
+                is converted to uppercase for case-insensitive matching.
+        
+        Returns:
+            Classification string: 'block', 'temporary', or 'unknown'.
+            Note: 'unknown' is treated the same as 'temporary' to avoid
+            false positives in blacklist additions.
+        
+        Example:
+            >>> error1 = Exception("USER_IS_BLOCKED")
+            >>> ErrorClassifier.classify_error(error1)
+            'block'
+            >>> 
+            >>> error2 = Exception("FLOOD_WAIT_30")
+            >>> ErrorClassifier.classify_error(error2)
+            'temporary'
+            >>> 
+            >>> error3 = Exception("Some unknown error")
+            >>> ErrorClassifier.classify_error(error3)
+            'temporary'
+        """
+        error_str = str(error).upper()
+        
+        # Check for block indicators
+        for indicator in cls.BLOCK_INDICATORS:
+            if indicator in error_str:
+                return 'block'
+        
+        # Check for temporary indicators
+        for indicator in cls.TEMPORARY_INDICATORS:
+            if indicator in error_str:
+                return 'temporary'
+        
+        # Default to temporary to avoid false positives
+        return 'temporary'
+    
+    @classmethod
+    def is_block_error(cls, error: Exception) -> bool:
+        """
+        Check if error indicates a block.
+        
+        Convenience method that returns True if the error is classified
+        as a block error. This is equivalent to checking if
+        classify_error(error) == 'block'.
+        
+        Args:
+            error: Exception from message send attempt.
+        
+        Returns:
+            True if error indicates block, False otherwise.
+        
+        Example:
+            >>> error = Exception("USER_IS_BLOCKED")
+            >>> ErrorClassifier.is_block_error(error)
+            True
+            >>> 
+            >>> error = Exception("FLOOD_WAIT_30")
+            >>> ErrorClassifier.is_block_error(error)
+            False
+        """
+        return cls.classify_error(error) == 'block'
+
+
+class DeliveryTracker:
+    """
+    Tracks message delivery attempts and failure counts per user.
+    
+    This class maintains in-memory counters for consecutive delivery failures
+    per user. When a delivery fails, the counter is incremented. When a delivery
+    succeeds, the counter is reset to zero. This is used to detect when a user
+    has blocked the system (after 2 consecutive failures).
+    
+    The failure counts are intentionally kept in memory only and are reset on
+    system restart. This provides a fresh start and avoids persisting temporary
+    failure states.
+    
+    Thread Safety:
+        This class is NOT thread-safe. It should be used within the context
+        of TelegramSessionManager which provides appropriate locking.
+    
+    Usage:
+        >>> tracker = DeliveryTracker()
+        >>> 
+        >>> # Record first failure
+        >>> count = tracker.record_failure('user123')
+        >>> print(count)  # 1
+        >>> 
+        >>> # Record second failure
+        >>> count = tracker.record_failure('user123')
+        >>> print(count)  # 2
+        >>> 
+        >>> # Success resets counter
+        >>> tracker.record_success('user123')
+        >>> count = tracker.get_failure_count('user123')
+        >>> print(count)  # 0
+    """
+    
+    def __init__(self):
+        """
+        Initialize delivery tracker with in-memory storage.
+        
+        Creates an empty dictionary to track failure counts. All counts
+        start at zero (not present in dictionary).
+        """
+        self._failure_counts: Dict[str, int] = {}
+    
+    def record_failure(self, user_id: str) -> int:
+        """
+        Record a delivery failure for a user.
+        
+        Increments the consecutive failure count for the specified user.
+        This is called after each failed delivery attempt. When the count
+        reaches 2 and the error is classified as a block, the user is
+        added to the blacklist.
+        
+        Args:
+            user_id: User identifier (username without @ or numeric user ID).
+        
+        Returns:
+            Current failure count for this user after incrementing.
+        
+        Example:
+            >>> tracker = DeliveryTracker()
+            >>> count = tracker.record_failure('user123')
+            >>> print(count)  # 1
+            >>> count = tracker.record_failure('user123')
+            >>> print(count)  # 2
+        """
+        current_count = self._failure_counts.get(user_id, 0)
+        self._failure_counts[user_id] = current_count + 1
+        return self._failure_counts[user_id]
+    
+    def record_success(self, user_id: str) -> None:
+        """
+        Record a successful delivery, resetting failure count.
+        
+        Resets the consecutive failure count for the specified user to zero.
+        This is called after each successful delivery. A successful delivery
+        indicates the user has not blocked us, so we reset the counter.
+        
+        Args:
+            user_id: User identifier (username without @ or numeric user ID).
+        
+        Example:
+            >>> tracker = DeliveryTracker()
+            >>> tracker.record_failure('user123')
+            >>> tracker.record_failure('user123')
+            >>> tracker.record_success('user123')  # Reset counter
+            >>> count = tracker.get_failure_count('user123')
+            >>> print(count)  # 0
+        """
+        if user_id in self._failure_counts:
+            del self._failure_counts[user_id]
+    
+    def get_failure_count(self, user_id: str) -> int:
+        """
+        Get current failure count for a user.
+        
+        Returns the number of consecutive delivery failures for the specified
+        user. Returns 0 if the user has no recorded failures.
+        
+        Args:
+            user_id: User identifier (username without @ or numeric user ID).
+        
+        Returns:
+            Number of consecutive failures. Returns 0 if user has no failures
+            or if the last delivery was successful.
+        
+        Example:
+            >>> tracker = DeliveryTracker()
+            >>> tracker.record_failure('user123')
+            >>> count = tracker.get_failure_count('user123')
+            >>> print(count)  # 1
+        """
+        return self._failure_counts.get(user_id, 0)
+    
+    def reset_all(self) -> None:
+        """
+        Reset all failure counts (called on system restart).
+        
+        Clears all failure counts, providing a fresh start. This is called
+        during system initialization in TelegramSessionManager.load_sessions_from_db()
+        to ensure that temporary failure states don't persist across restarts.
+        
+        The blacklist itself persists across restarts, but failure counts
+        are intentionally reset to give users a fresh chance.
+        
+        Example:
+            >>> tracker = DeliveryTracker()
+            >>> tracker.record_failure('user123')
+            >>> tracker.record_failure('user456')
+            >>> tracker.reset_all()
+            >>> print(tracker.get_failure_count('user123'))  # 0
+            >>> print(tracker.get_failure_count('user456'))  # 0
+        """
+        self._failure_counts.clear()
 
 
 class OperationPriority(Enum):

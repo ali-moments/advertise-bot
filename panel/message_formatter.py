@@ -513,3 +513,148 @@ class MessageFormatter:
             result += f"   صف: {queue} عملیات\n\n"
         
         return result
+    
+    @staticmethod
+    def format_operation_history(
+        operations: List[Dict[str, Any]],
+        page: int = 1,
+        total_pages: int = 1
+    ) -> str:
+        """
+        Format operation history list message
+        
+        Args:
+            operations: List of operation dicts
+            page: Current page
+            total_pages: Total pages
+        
+        Returns:
+            Formatted operation history string
+            
+        Requirements: AC-6.7
+        """
+        if not operations:
+            return "📜 **تاریخچه عملیات**\n\nهیچ عملیاتی یافت نشد."
+        
+        result = f"📜 **تاریخچه عملیات** (صفحه {page}/{total_pages})\n\n"
+        
+        for idx, op in enumerate(operations, 1):
+            op_type = op.get('operation_type', 'نامشخص')
+            status = op.get('status', 'نامشخص')
+            
+            # Status icon and text
+            status_map = {
+                'running': ('⏳', 'در حال اجرا'),
+                'completed': ('✅', 'تکمیل شده'),
+                'failed': ('❌', 'ناموفق'),
+                'cancelled': ('⏸️', 'لغو شده')
+            }
+            status_icon, status_text = status_map.get(status, ('❓', status))
+            
+            # Progress info
+            completed = op.get('completed', 0)
+            total = op.get('total', 0)
+            failed = op.get('failed', 0)
+            
+            # Time info
+            started_at = op.get('started_at')
+            if started_at:
+                time_ago = MessageFormatter._format_time_ago(started_at)
+            else:
+                time_ago = 'نامشخص'
+            
+            result += f"{idx}. {status_icon} **{op_type}**\n"
+            result += f"   وضعیت: {status_text}\n"
+            result += f"   پیشرفت: {completed}/{total}"
+            if failed > 0:
+                result += f" (خطا: {failed})"
+            result += f"\n   زمان: {time_ago}\n\n"
+        
+        return result
+    
+    @staticmethod
+    def format_operation_details(operation: Dict[str, Any]) -> str:
+        """
+        Format detailed operation information
+        
+        Args:
+            operation: Operation dict with all details
+        
+        Returns:
+            Formatted operation details string
+            
+        Requirements: AC-6.7
+        """
+        op_id = operation.get('operation_id', 'نامشخص')
+        op_type = operation.get('operation_type', 'نامشخص')
+        status = operation.get('status', 'نامشخص')
+        
+        # Status icon and text
+        status_map = {
+            'running': ('⏳', 'در حال اجرا'),
+            'completed': ('✅', 'تکمیل شده'),
+            'failed': ('❌', 'ناموفق'),
+            'cancelled': ('⏸️', 'لغو شده')
+        }
+        status_icon, status_text = status_map.get(status, ('❓', status))
+        
+        result = f"📋 **جزئیات عملیات**\n\n"
+        result += f"**شناسه:** `{op_id}`\n"
+        result += f"**نوع:** {op_type}\n"
+        result += f"**وضعیت:** {status_icon} {status_text}\n\n"
+        
+        # Progress information
+        total = operation.get('total', 0)
+        completed = operation.get('completed', 0)
+        failed = operation.get('failed', 0)
+        remaining = total - completed - failed
+        
+        if total > 0:
+            progress_percent = int((completed + failed) / total * 100)
+            success_rate = int(completed / (completed + failed) * 100) if (completed + failed) > 0 else 0
+            
+            result += f"**پیشرفت:**\n"
+            result += f"• کل: {total}\n"
+            result += f"• تکمیل شده: {completed}\n"
+            result += f"• ناموفق: {failed}\n"
+            result += f"• باقیمانده: {remaining}\n"
+            result += f"• درصد پیشرفت: {progress_percent}%\n"
+            result += f"• نرخ موفقیت: {success_rate}%\n\n"
+        
+        # Time information
+        started_at = operation.get('started_at')
+        if started_at:
+            elapsed = datetime.now().timestamp() - started_at
+            elapsed_str = MessageFormatter._format_duration(elapsed)
+            time_ago = MessageFormatter._format_time_ago(started_at)
+            
+            result += f"**زمان:**\n"
+            result += f"• شروع: {time_ago}\n"
+            result += f"• مدت زمان: {elapsed_str}\n"
+            
+            # Estimate remaining time for running operations
+            if status == 'running' and completed > 0:
+                avg_time = elapsed / completed
+                eta_seconds = avg_time * remaining
+                eta_str = MessageFormatter._format_duration(eta_seconds)
+                result += f"• زمان تخمینی باقیمانده: {eta_str}\n"
+            
+            result += "\n"
+        
+        # Error message if failed
+        error_msg = operation.get('error_message')
+        if error_msg:
+            result += f"**خطا:**\n{error_msg}\n\n"
+        
+        # Result data if completed
+        result_data = operation.get('result_data', {})
+        if result_data and status == 'completed':
+            result += f"**نتیجه:**\n"
+            for key, value in result_data.items():
+                result += f"• {key}: {value}\n"
+        
+        # Last update time
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result += f"\n⏰ آخرین بروزرسانی: {now}"
+        
+        return result

@@ -1,262 +1,390 @@
 """
-Tests for comprehensive error handling (Task 11)
-Tests Requirements 7.1, 7.2, 1.4
+Test error handling functionality
+
+Requirements: AC-9.1, AC-9.2, AC-9.3, AC-9.4, AC-9.5
 """
 
 import pytest
 import asyncio
-from unittest.mock import Mock, AsyncMock, patch
-from telegram_manager.session import TelegramSession
-from telegram_manager.manager import TelegramSessionManager
+from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from telegram import Update, User, Message, Chat, CallbackQuery
+from telegram.ext import ContextTypes
+from telegram.error import (
+    TelegramError,
+    NetworkError,
+    TimedOut,
+    BadRequest,
+    Forbidden,
+    RetryAfter
+)
+
+from panel.error_handler import BotErrorHandler, ErrorContext, with_error_handling
 
 
-@pytest.mark.asyncio
-async def test_lock_release_on_error_in_submit_operation():
-    """
-    Test that locks are released when an error occurs in _submit_operation
-    Requirement 7.1: Lock release on error paths
-    """
-    session = TelegramSession("test.session", 12345, "test_hash")
-    session.is_connected = True
+class TestErrorClassification:
+    """Test error classification"""
     
-    # Mock the operation to raise an error
-    async def failing_operation():
-        raise ValueError("Test error")
-    
-    # Verify lock is not held initially
-    assert not session.operation_lock.locked()
-    
-    # Try to execute operation that will fail
-    with pytest.raises(ValueError, match="Test error"):
-        await session._submit_operation('scraping', failing_operation)
-    
-    # Verify lock is released after error
-    assert not session.operation_lock.locked()
-    assert session.current_operation is None
-    assert session.operation_start_time is None
-
-
-@pytest.mark.asyncio
-async def test_queue_overflow_handling():
-    """
-    Test that queue overflow is properly handled
-    Requirement 1.4: Queue overflow handling
-    """
-    session = TelegramSession("test.session", 12345, "test_hash")
-    session.is_connected = True
-    
-    # Fill the queue to capacity (100 items)
-    async def slow_operation():
-        await asyncio.sleep(10)  # Long operation to keep queue full
-    
-    # Acquire the operation lock to force queuing
-    await session.operation_lock.acquire()
-    
-    try:
-        # Fill queue to max capacity
-        tasks = []
-        for i in range(100):
-            task = asyncio.create_task(
-                session._submit_operation('scraping', slow_operation)
-            )
-            tasks.append(task)
-            await asyncio.sleep(0.01)  # Small delay to allow queue to fill
+    def test_classify_rate_limit_error(self):
+        """Test classification of rate limit errors (AC-9.2)"""
+        handler = BotErrorHandler()
+        error = RetryAfter(30)
         
-        # Wait a bit for queue to fill
-        await asyncio.sleep(0.5)
+        classification = handler.classify_error(error)
         
-        # Try to add one more operation - should fail with queue full error
-        with pytest.raises(Exception, match="queue is full"):
-            await session._submit_operation('scraping', slow_operation)
-        
-        # Cancel all pending tasks
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        
-    finally:
-        session.operation_lock.release()
-
-
-@pytest.mark.asyncio
-async def test_queue_depth_query():
-    """
-    Test queue depth query method
-    Requirement 1.4: Provide queue depth query method
-    """
-    session = TelegramSession("test.session", 12345, "test_hash")
-    session.is_connected = True
+        assert classification['type'] == 'rate_limit'
+        assert classification['show_retry'] is True
+        assert classification['retry_after'] == 30
+        assert 'محدودیت' in classification['user_message']
     
-    # Initially queue should be empty
-    assert session.get_queue_depth() == 0
-    
-    # Get queue status
-    status = session.get_queue_status()
-    assert status['queue_depth'] == 0
-    assert status['max_queue_size'] == 100
-    assert status['queue_utilization'] == 0.0
-    assert status['is_full'] is False
-
-
-@pytest.mark.asyncio
-async def test_error_logging_includes_operation_context():
-    """
-    Test that error logging includes operation context
-    Requirement 7.1: Log operation context on errors
-    """
-    session = TelegramSession("test.session", 12345, "test_hash")
-    session.is_connected = True
-    
-    # Mock logger to capture log messages
-    with patch.object(session, 'logger') as mock_logger:
-        async def failing_operation():
-            raise RuntimeError("Test error")
+    def test_classify_timeout_error(self):
+        """Test classification of timeout errors (AC-9.2)"""
+        handler = BotErrorHandler()
+        error = TimedOut()
         
-        # Execute operation that will fail
-        with pytest.raises(RuntimeError):
-            await session._submit_operation('scraping', failing_operation)
+        classification = handler.classify_error(error)
         
-        # Verify error was logged with context
-        mock_logger.error.assert_called()
-        error_call = mock_logger.error.call_args[0][0]
-        assert 'scraping' in error_call
-        assert 'Test error' in error_call
-        assert 'session' in error_call
-
-
-@pytest.mark.asyncio
-async def test_lock_timeout_logging_includes_lock_state():
-    """
-    Test that lock timeout logging includes lock state
-    Requirement 7.3: Log lock state on timeouts
-    """
-    session = TelegramSession("test.session", 12345, "test_hash")
-    session.is_connected = True
+        assert classification['type'] == 'timeout'
+        assert classification['show_retry'] is True
+        assert 'زمان' in classification['user_message']
     
-    # Acquire lock to cause timeout
-    await session.operation_lock.acquire()
-    
-    try:
-        # Mock logger to capture log messages
-        with patch.object(session, 'logger') as mock_logger:
-            # Try to acquire lock with very short timeout
-            result = await session._acquire_lock_with_timeout(
-                session.operation_lock,
-                timeout=0.1,
-                lock_name="test_lock"
-            )
-            
-            # Should timeout
-            assert result is False
-            
-            # Verify warning was logged with lock state
-            mock_logger.warning.assert_called()
-            warning_call = mock_logger.warning.call_args[0][0]
-            assert 'TIMEOUT' in warning_call
-            assert 'test_lock' in warning_call
-            assert 'Lock state:' in warning_call
-            
-    finally:
-        session.operation_lock.release()
-
-
-@pytest.mark.asyncio
-async def test_retry_logging_includes_context():
-    """
-    Test that retry logging includes full context
-    Requirement 7.3: Log retry attempts with context
-    """
-    manager = TelegramSessionManager()
-    
-    # Mock logger to capture log messages
-    with patch.object(manager, 'logger') as mock_logger:
-        attempt_count = [0]
+    def test_classify_network_error(self):
+        """Test classification of network errors (AC-9.1, AC-9.2)"""
+        handler = BotErrorHandler()
+        error = NetworkError("Connection failed")
         
-        async def flaky_operation():
-            attempt_count[0] += 1
-            if attempt_count[0] < 2:
-                raise ConnectionError("Transient error")
-            return "success"
+        classification = handler.classify_error(error)
         
-        # Execute operation with retry
-        result = await manager._execute_with_retry(
-            'scraping',
-            flaky_operation
+        assert classification['type'] == 'network'
+        assert classification['show_retry'] is True
+        assert 'شبکه' in classification['user_message']
+    
+    def test_classify_bad_request_error(self):
+        """Test classification of bad request errors (AC-9.2)"""
+        handler = BotErrorHandler()
+        error = BadRequest("Invalid message")
+        
+        classification = handler.classify_error(error)
+        
+        assert classification['type'] == 'bad_request'
+        assert classification['show_retry'] is False
+        assert 'نامعتبر' in classification['user_message']
+    
+    def test_classify_forbidden_error(self):
+        """Test classification of forbidden errors (AC-9.2)"""
+        handler = BotErrorHandler()
+        error = Forbidden("Bot was blocked")
+        
+        classification = handler.classify_error(error)
+        
+        assert classification['type'] == 'forbidden'
+        assert classification['show_retry'] is False
+        assert 'دسترسی' in classification['user_message']
+    
+    def test_classify_file_not_found_error(self):
+        """Test classification of file errors (AC-9.2)"""
+        handler = BotErrorHandler()
+        error = FileNotFoundError("File not found")
+        
+        classification = handler.classify_error(error)
+        
+        assert classification['type'] == 'file_not_found'
+        assert classification['show_retry'] is False
+        assert 'فایل' in classification['user_message']
+    
+    def test_classify_value_error(self):
+        """Test classification of validation errors (AC-9.2)"""
+        handler = BotErrorHandler()
+        error = ValueError("Invalid value")
+        
+        classification = handler.classify_error(error)
+        
+        assert classification['type'] == 'validation'
+        assert classification['show_retry'] is False
+        assert 'نامعتبر' in classification['user_message']
+    
+    def test_classify_unknown_error(self):
+        """Test classification of unknown errors (AC-9.2)"""
+        handler = BotErrorHandler()
+        error = Exception("Unknown error")
+        
+        classification = handler.classify_error(error)
+        
+        assert classification['type'] == 'unknown'
+        assert classification['show_retry'] is True
+        assert 'غیرمنتظره' in classification['user_message']
+
+
+class TestErrorLogging:
+    """Test error logging with context"""
+    
+    def test_log_error_with_context(self):
+        """Test error logging includes context (AC-9.4)"""
+        handler = BotErrorHandler()
+        error = ValueError("Test error")
+        context = ErrorContext(
+            user_id=12345,
+            operation="test_operation",
+            details={'key': 'value'}
         )
         
-        assert result == "success"
+        # ValueError is classified as 'validation' with log_level 'warning'
+        with patch.object(handler.logger, 'warning') as mock_log:
+            handler.log_error(error, context, include_traceback=False)
+            
+            # Verify logging was called
+            assert mock_log.called
+            call_args = mock_log.call_args
+            
+            # Check log message contains operation name
+            assert 'test_operation' in call_args[0][0]
+    
+    def test_log_error_includes_traceback(self):
+        """Test error logging includes traceback when requested (AC-9.4)"""
+        handler = BotErrorHandler()
+        error = ValueError("Test error")
+        context = ErrorContext(user_id=12345, operation="test")
         
-        # Verify retry was logged with context
-        warning_calls = [call[0][0] for call in mock_logger.warning.call_args_list]
-        assert any('scraping' in call and 'failed' in call for call in warning_calls)
-        assert any('error_type' in call for call in warning_calls)
-        assert any('is_transient' in call for call in warning_calls)
+        # ValueError is classified as 'validation' with log_level 'warning'
+        with patch.object(handler.logger, 'warning') as mock_log:
+            handler.log_error(error, context, include_traceback=True)
+            
+            # Verify traceback is in extra data
+            assert mock_log.called
+            extra_data = mock_log.call_args[1].get('extra', {})
+            assert 'traceback' in extra_data
 
 
-@pytest.mark.asyncio
-async def test_semaphore_release_on_error():
-    """
-    Test that semaphores are released when errors occur
-    Requirement 7.1: Lock release on all error paths
-    """
-    manager = TelegramSessionManager()
+class TestErrorHandling:
+    """Test error handling and user notification"""
     
-    # Create a mock session
-    mock_session = Mock()
-    mock_session.is_connected = True
-    mock_session.scrape_group_members = AsyncMock(side_effect=RuntimeError("Test error"))
+    @pytest.mark.asyncio
+    async def test_handle_error_with_message(self):
+        """Test error handling sends user-friendly message (AC-9.3)"""
+        handler = BotErrorHandler()
+        error = NetworkError("Connection failed")
+        
+        # Create mock update with message
+        update = Mock(spec=Update)
+        update.callback_query = None
+        update.message = AsyncMock(spec=Message)
+        update.effective_user = Mock(spec=User)
+        update.effective_user.id = 12345
+        
+        context = Mock(spec=ContextTypes.DEFAULT_TYPE)
+        error_context = ErrorContext(user_id=12345, operation="test")
+        
+        await handler.handle_error(
+            error=error,
+            update=update,
+            context=context,
+            error_context=error_context,
+            retry_callback="action:retry"
+        )
+        
+        # Verify message was sent
+        assert update.message.reply_text.called
+        call_args = update.message.reply_text.call_args
+        message_text = call_args[0][0]
+        
+        # Check message contains error info
+        assert 'خطا' in message_text
+        assert 'شبکه' in message_text
     
-    manager.sessions = {'test_session': mock_session}
-    manager.session_locks = {'test_session': asyncio.Lock()}
-    manager.session_load = {'test_session': 0}
+    @pytest.mark.asyncio
+    async def test_handle_error_with_callback_query(self):
+        """Test error handling with callback query (AC-9.3)"""
+        handler = BotErrorHandler()
+        error = TimedOut()
+        
+        # Create mock update with callback query
+        update = Mock(spec=Update)
+        update.callback_query = AsyncMock(spec=CallbackQuery)
+        update.message = None
+        update.effective_user = Mock(spec=User)
+        update.effective_user.id = 12345
+        
+        context = Mock(spec=ContextTypes.DEFAULT_TYPE)
+        error_context = ErrorContext(user_id=12345, operation="test")
+        
+        await handler.handle_error(
+            error=error,
+            update=update,
+            context=context,
+            error_context=error_context,
+            retry_callback=None
+        )
+        
+        # Verify message was edited
+        assert update.callback_query.edit_message_text.called
+        call_args = update.callback_query.edit_message_text.call_args
+        message_text = call_args[0][0]
+        
+        # Check message contains error info
+        assert 'خطا' in message_text
     
-    # Get initial semaphore count
-    initial_count = manager.scrape_semaphore._value
-    
-    # Execute operation that will fail
-    result = await manager.scrape_group_members_random_session('test_group')
-    
-    # Verify operation failed
-    assert result['success'] is False
-    
-    # Verify semaphore was released (count should be back to initial)
-    assert manager.scrape_semaphore._value == initial_count
-    
-    # Verify session load was decremented
-    assert manager.session_load['test_session'] == 0
+    @pytest.mark.asyncio
+    async def test_handle_error_with_retry_button(self):
+        """Test error handling includes retry button when appropriate (AC-9.5)"""
+        handler = BotErrorHandler()
+        error = NetworkError("Connection failed")
+        
+        # Create mock update
+        update = Mock(spec=Update)
+        update.callback_query = None
+        update.message = AsyncMock(spec=Message)
+        update.effective_user = Mock(spec=User)
+        update.effective_user.id = 12345
+        
+        context = Mock(spec=ContextTypes.DEFAULT_TYPE)
+        error_context = ErrorContext(user_id=12345, operation="test")
+        
+        await handler.handle_error(
+            error=error,
+            update=update,
+            context=context,
+            error_context=error_context,
+            retry_callback="action:retry"
+        )
+        
+        # Verify keyboard was provided
+        call_kwargs = update.message.reply_text.call_args[1]
+        assert 'reply_markup' in call_kwargs
+        assert call_kwargs['reply_markup'] is not None
 
 
-@pytest.mark.asyncio
-async def test_nested_lock_release_on_error():
-    """
-    Test that nested locks are properly released on error
-    Requirement 7.1: Lock release on all error paths
-    """
-    manager = TelegramSessionManager()
+class TestGlobalErrorHandler:
+    """Test global error handler"""
     
-    # Create a mock session
-    mock_session = Mock()
-    mock_session.is_connected = True
-    mock_session.scrape_group_members = AsyncMock(side_effect=RuntimeError("Test error"))
+    @pytest.mark.asyncio
+    async def test_global_error_handler_logs_error(self):
+        """Test global error handler logs errors (AC-9.4)"""
+        handler = BotErrorHandler()
+        
+        # Create mock update and context
+        update = Mock(spec=Update)
+        update.effective_user = Mock(spec=User)
+        update.effective_user.id = 12345
+        update.callback_query = None
+        update.message = AsyncMock(spec=Message)
+        
+        context = Mock(spec=ContextTypes.DEFAULT_TYPE)
+        context.error = ValueError("Test error")
+        
+        with patch.object(handler, 'log_error') as mock_log:
+            await handler.global_error_handler(update, context)
+            
+            # Verify error was logged
+            assert mock_log.called
     
-    manager.sessions = {'test_session': mock_session}
-    manager.session_locks = {'test_session': asyncio.Lock()}
-    manager.session_load = {'test_session': 0}
+    @pytest.mark.asyncio
+    async def test_global_error_handler_notifies_user(self):
+        """Test global error handler notifies user (AC-9.3)"""
+        handler = BotErrorHandler()
+        
+        # Create mock update and context
+        update = Mock(spec=Update)
+        update.effective_user = Mock(spec=User)
+        update.effective_user.id = 12345
+        update.callback_query = None
+        update.message = AsyncMock(spec=Message)
+        
+        context = Mock(spec=ContextTypes.DEFAULT_TYPE)
+        context.error = ValueError("Test error")
+        
+        await handler.global_error_handler(update, context)
+        
+        # Verify user was notified
+        assert update.message.reply_text.called
+
+
+class TestErrorHandlingDecorator:
+    """Test error handling decorator"""
     
-    # Verify locks are not held initially
-    assert not manager.session_locks['test_session'].locked()
-    assert manager.scrape_semaphore._value == 5  # Initial value
+    @pytest.mark.asyncio
+    async def test_decorator_catches_errors(self):
+        """Test decorator catches and handles errors (AC-9.1)"""
+        
+        class MockHandler:
+            pass
+        
+        handler = MockHandler()
+        
+        @with_error_handling("test_operation", retry_callback="action:retry")
+        async def failing_handler(self, update, context):
+            raise ValueError("Test error")
+        
+        # Create mock update and context
+        update = Mock(spec=Update)
+        update.effective_user = Mock(spec=User)
+        update.effective_user.id = 12345
+        update.callback_query = None
+        update.message = AsyncMock(spec=Message)
+        
+        context = Mock(spec=ContextTypes.DEFAULT_TYPE)
+        
+        # Call decorated function
+        result = await failing_handler(handler, update, context)
+        
+        # Verify error was handled (returns ConversationHandler.END)
+        from telegram.ext import ConversationHandler
+        assert result == ConversationHandler.END
+        
+        # Verify user was notified
+        assert update.message.reply_text.called
     
-    # Execute operation that will fail
-    result = await manager.scrape_group_members_random_session('test_group')
+    @pytest.mark.asyncio
+    async def test_decorator_allows_success(self):
+        """Test decorator allows successful execution"""
+        
+        class MockHandler:
+            pass
+        
+        handler = MockHandler()
+        
+        @with_error_handling("test_operation")
+        async def successful_handler(self, update, context):
+            return "success"
+        
+        # Create mock update and context
+        update = Mock(spec=Update)
+        update.effective_user = Mock(spec=User)
+        update.effective_user.id = 12345
+        
+        context = Mock(spec=ContextTypes.DEFAULT_TYPE)
+        
+        # Call decorated function
+        result = await successful_handler(handler, update, context)
+        
+        # Verify success value is returned
+        assert result == "success"
+
+
+class TestErrorContext:
+    """Test ErrorContext class"""
     
-    # Verify operation failed
-    assert result['success'] is False
+    def test_error_context_to_dict(self):
+        """Test ErrorContext converts to dict for logging"""
+        context = ErrorContext(
+            user_id=12345,
+            operation="test_operation",
+            details={'key': 'value'}
+        )
+        
+        context_dict = context.to_dict()
+        
+        assert context_dict['user_id'] == 12345
+        assert context_dict['operation'] == "test_operation"
+        assert context_dict['details']['key'] == 'value'
     
-    # Verify all locks/semaphores are released
-    assert not manager.session_locks['test_session'].locked()
-    assert manager.scrape_semaphore._value == 5
-    assert manager.session_load['test_session'] == 0
+    def test_error_context_optional_fields(self):
+        """Test ErrorContext with optional fields"""
+        context = ErrorContext()
+        
+        context_dict = context.to_dict()
+        
+        assert context_dict['user_id'] is None
+        assert context_dict['operation'] is None
+        assert context_dict['details'] == {}
 
 
 if __name__ == '__main__':

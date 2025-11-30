@@ -5,6 +5,7 @@ TelegramSessionManager class - Multi-session management
 import asyncio
 import logging
 import random
+import time
 from typing import List, Dict, Optional, Callable
 from .session import TelegramSession
 from .config import SessionConfig
@@ -17,7 +18,11 @@ from .constants import (
     SESSION_COUNT,
     MAX_CONCURRENT_OPERATIONS,
     DAILY_MESSAGES_LIMIT,
-    DAILY_GROUPS_LIMIT
+    DAILY_GROUPS_LIMIT,
+    BLACKLIST_ENABLED,
+    BLACKLIST_STORAGE_PATH,
+    BLACKLIST_FAILURE_THRESHOLD,
+    BLACKLIST_AUTO_ADD
 )
 
 
@@ -113,6 +118,15 @@ class TelegramSessionManager:
         # Pending operations per session (for redistribution on failure) (Requirement 23.1, 23.5)
         self.pending_operations: Dict[str, List] = {}  # session_name -> list of operations
         self.pending_ops_lock = asyncio.Lock()  # Protect pending operations
+        
+        # Blacklist management (user-blocking-detection feature)
+        from .blacklist import BlocklistManager
+        from .models import DeliveryTracker
+        self.blacklist_manager = BlocklistManager(storage_path=BLACKLIST_STORAGE_PATH)
+        self.delivery_tracker = DeliveryTracker()
+        self.blacklist_enabled = BLACKLIST_ENABLED
+        self.blacklist_failure_threshold = BLACKLIST_FAILURE_THRESHOLD
+        self.blacklist_auto_add = BLACKLIST_AUTO_ADD
 
     async def load_sessions_from_db(self) -> Dict[str, bool]:
         """
@@ -122,6 +136,20 @@ class TelegramSessionManager:
             Dict mapping session names to load success status
         """
         try:
+            # Load blacklist from storage on system startup (Requirement 3.1)
+            # This should happen regardless of whether accounts are found
+            if self.blacklist_enabled:
+                try:
+                    await self.blacklist_manager.load()
+                    self.logger.info("✅ Loaded blacklist from storage")
+                except Exception as e:
+                    self.logger.error(f"❌ Failed to load blacklist: {e}")
+            
+            # Reset failure counts on system startup (Requirement 4.5)
+            # This should happen regardless of whether accounts are found
+            self.delivery_tracker.reset_all()
+            self.logger.info("✅ Reset delivery failure counts")
+            
             # Initialize database manager
             db_manager = DatabaseManager(DB_PATH)
             
@@ -520,6 +548,34 @@ class TelegramSessionManager:
         
         try:
             for i, recipient in enumerate(recipients):
+                # Check blacklist before attempting delivery (Requirement 2.1)
+                is_blacklisted = await self.blacklist_manager.is_blacklisted(recipient)
+                
+                if is_blacklisted:
+                    # Skip delivery and log event (Requirement 2.2, 2.3)
+                    self.logger.info(
+                        f"⏭️ Skipping blacklisted user {recipient}",
+                        extra={
+                            'operation_type': 'text_message_send',
+                            'recipient': recipient,
+                            'blacklisted': True,
+                            'session_name': session_name
+                        }
+                    )
+                    results[recipient] = MessageResult(
+                        recipient=recipient,
+                        success=False,
+                        session_used=session_name,
+                        error='User is blacklisted',
+                        blacklisted=True
+                    )
+                    
+                    # Apply delay even for skipped recipients to maintain rate limiting
+                    if i < len(recipients) - 1:
+                        await asyncio.sleep(delay)
+                    
+                    continue
+                
                 try:
                     # Send message with retry logic (Requirement 5.1)
                     result_dict = await self._execute_with_retry(
@@ -537,8 +593,12 @@ class TelegramSessionManager:
                         error=result_dict.get('error')
                     )
                     
-                    # Log success with structured logging (Requirement 13.2, 13.3)
+                    # Track delivery result (Requirement 4.1, 4.2)
                     if results[recipient].success:
+                        # Record success - resets failure count
+                        self.delivery_tracker.record_success(recipient)
+                        
+                        # Log success with structured logging (Requirement 13.2, 13.3)
                         self.logger.debug(
                             f"✅ Sent to {recipient} via {session_name}",
                             extra={
@@ -549,6 +609,11 @@ class TelegramSessionManager:
                             }
                         )
                     else:
+                        # Record failure and check for block detection (Requirement 1.1, 1.2, 1.3, 1.4)
+                        error = Exception(results[recipient].error) if results[recipient].error else Exception("Unknown error")
+                        await self._handle_delivery_failure(recipient, error, session_name)
+                        
+                        # Log failure with structured logging (Requirement 13.2, 13.3)
                         self.logger.warning(
                             f"❌ Failed to send to {recipient} via {session_name}: {results[recipient].error}",
                             extra={
@@ -569,6 +634,9 @@ class TelegramSessionManager:
                         session_used=session_name,
                         error=str(e)
                     )
+                    
+                    # Handle delivery failure for block detection (Requirement 1.1, 1.2, 1.3, 1.4)
+                    await self._handle_delivery_failure(recipient, e, session_name)
                 
                 # Apply delay between sends (Requirement 3.1, 3.5)
                 if i < len(recipients) - 1:
@@ -839,6 +907,35 @@ class TelegramSessionManager:
         
         try:
             for i, recipient in enumerate(recipients):
+                # Check blacklist before attempting delivery (Requirement 2.1)
+                is_blacklisted = await self.blacklist_manager.is_blacklisted(recipient)
+                
+                if is_blacklisted:
+                    # Skip delivery and log event (Requirement 2.2, 2.3)
+                    self.logger.info(
+                        f"⏭️ Skipping blacklisted user {recipient}",
+                        extra={
+                            'operation_type': 'media_message_send',
+                            'media_type': media_type,
+                            'recipient': recipient,
+                            'blacklisted': True,
+                            'session_name': session_name
+                        }
+                    )
+                    results[recipient] = MessageResult(
+                        recipient=recipient,
+                        success=False,
+                        session_used=session_name,
+                        error='User is blacklisted',
+                        blacklisted=True
+                    )
+                    
+                    # Apply delay even for skipped recipients to maintain rate limiting
+                    if i < len(recipients) - 1:
+                        await asyncio.sleep(delay)
+                    
+                    continue
+                
                 try:
                     # Select appropriate send method based on media type
                     if media_type == 'image':
@@ -867,8 +964,12 @@ class TelegramSessionManager:
                         error=result_dict.get('error')
                     )
                     
-                    # Log success with structured logging (Requirement 13.2, 13.3)
+                    # Track delivery result (Requirement 4.1, 4.2)
                     if results[recipient].success:
+                        # Record success - resets failure count
+                        self.delivery_tracker.record_success(recipient)
+                        
+                        # Log success with structured logging (Requirement 13.2, 13.3)
                         self.logger.debug(
                             f"✅ Sent {media_type} to {recipient} via {session_name}",
                             extra={
@@ -881,6 +982,11 @@ class TelegramSessionManager:
                             }
                         )
                     else:
+                        # Record failure and check for block detection (Requirement 1.1, 1.2, 1.3, 1.4)
+                        error = Exception(results[recipient].error) if results[recipient].error else Exception("Unknown error")
+                        await self._handle_delivery_failure(recipient, error, session_name)
+                        
+                        # Log failure with structured logging (Requirement 13.2, 13.3)
                         self.logger.warning(
                             f"❌ Failed to send {media_type} to {recipient} via {session_name}: {results[recipient].error}",
                             extra={
@@ -902,6 +1008,9 @@ class TelegramSessionManager:
                         session_used=session_name,
                         error=str(e)
                     )
+                    
+                    # Handle delivery failure for block detection (Requirement 1.1, 1.2, 1.3, 1.4)
+                    await self._handle_delivery_failure(recipient, e, session_name)
                 
                 # Apply delay between sends (Requirement 3.1, 3.5)
                 if i < len(recipients) - 1:
@@ -1890,6 +1999,75 @@ class TelegramSessionManager:
         self.logger.debug(f"Unknown error type, treating as transient: {error_type}")
         return True
     
+    async def _handle_delivery_failure(
+        self,
+        recipient: str,
+        error: Exception,
+        session_name: str
+    ) -> None:
+        """
+        Handle delivery failure by tracking failures and detecting blocks
+        
+        This method:
+        1. Records the failure in the delivery tracker
+        2. Classifies the error to determine if it's a block
+        3. If it's the second consecutive failure with a block error, adds user to blacklist
+        4. Logs blocking events with user ID, timestamp, and session name
+        
+        Args:
+            recipient: User identifier that failed
+            error: Exception that occurred during delivery
+            session_name: Session that attempted the delivery
+            
+        Requirements: 1.1, 1.2, 1.3, 1.4, 4.1, 4.2, 4.4, 6.5
+        """
+        from .models import ErrorClassifier
+        
+        # Record failure and get current count (Requirement 4.1)
+        failure_count = self.delivery_tracker.record_failure(recipient)
+        
+        # Classify the error (Requirement 1.5, 6.1, 6.2, 6.3, 6.4)
+        error_classification = ErrorClassifier.classify_error(error)
+        is_block_error = ErrorClassifier.is_block_error(error)
+        
+        # Log error classification (Requirement 6.5)
+        self.logger.debug(
+            f"🔍 Error classified for {recipient}: {error_classification}",
+            extra={
+                'operation_type': 'error_classification',
+                'recipient': recipient,
+                'error_type': type(error).__name__,
+                'error_message': str(error),
+                'classification': error_classification,
+                'is_block_error': is_block_error,
+                'failure_count': failure_count,
+                'session_name': session_name
+            }
+        )
+        
+        # Check if this is the second consecutive failure with a block error (Requirement 1.1, 4.4)
+        if failure_count >= 2 and is_block_error:
+            # Add user to blacklist (Requirement 1.2, 1.3)
+            await self.blacklist_manager.add(
+                user_id=recipient,
+                reason="block_detected",
+                session_name=session_name
+            )
+            
+            # Log blocking event with user ID, timestamp, and session name (Requirement 1.4)
+            self.logger.warning(
+                f"🚫 User {recipient} added to blacklist after {failure_count} consecutive failures",
+                extra={
+                    'operation_type': 'block_detection',
+                    'recipient': recipient,
+                    'failure_count': failure_count,
+                    'error_classification': error_classification,
+                    'session_name': session_name,
+                    'reason': 'block_detected',
+                    'timestamp': time.time()
+                }
+            )
+    
     async def _execute_with_retry(
         self,
         operation_type: str,
@@ -2842,8 +3020,7 @@ class TelegramSessionManager:
         scraping_results = await self.bulk_scrape_groups(
             groups=scrapable_targets,
             join_first=join_first,
-            max_members=max_members,
-            enforce_daily_limits=True
+            max_members=max_members
         )
         
         return {
@@ -2853,3 +3030,245 @@ class TelegramSessionManager:
             'total_scrapable': len(scrapable_targets),
             'total_scraped': len([r for r in scraping_results.values() if r.get('success')])
         }
+
+    # Manual Blacklist Management Interface (Task 6)
+    # Requirements: 5.1, 5.2, 5.3, 5.4, 5.5
+    
+    async def add_to_blacklist(self, user_id: str, reason: str = "manual") -> Dict[str, any]:
+        """
+        Manually add a user to the blacklist
+        
+        Args:
+            user_id: User identifier to add
+            reason: Reason for blacklisting (default: "manual")
+            
+        Returns:
+            Dict with success status and message
+            
+        Requirements: 5.1, 5.5
+        """
+        from .models import RecipientValidator
+        
+        # Validate user identifier format (Requirement 5.5)
+        validation_result = RecipientValidator.validate_recipient(user_id)
+        
+        if not validation_result.valid:
+            error_messages = [error.message for error in validation_result.errors]
+            self.logger.warning(
+                f"❌ Invalid user identifier for blacklist addition: {user_id}",
+                extra={
+                    'operation_type': 'manual_blacklist_add',
+                    'user_id': user_id,
+                    'validation_errors': error_messages
+                }
+            )
+            return {
+                'success': False,
+                'user_id': user_id,
+                'error': f"Invalid user identifier: {'; '.join(error_messages)}"
+            }
+        
+        try:
+            # Add to blacklist and persist (Requirement 5.1)
+            await self.blacklist_manager.add(user_id, reason=reason, session_name=None)
+            
+            # Log manual operation (Requirement 1.4, 2.2, 6.5)
+            self.logger.info(
+                f"✅ Manually added user {user_id} to blacklist",
+                extra={
+                    'operation_type': 'manual_blacklist_add',
+                    'user_id': user_id,
+                    'reason': reason,
+                    'admin_action': True
+                }
+            )
+            
+            return {
+                'success': True,
+                'user_id': user_id,
+                'message': f"User {user_id} added to blacklist"
+            }
+            
+        except Exception as e:
+            self.logger.error(
+                f"❌ Failed to add user {user_id} to blacklist: {e}",
+                extra={
+                    'operation_type': 'manual_blacklist_add',
+                    'user_id': user_id,
+                    'error': str(e)
+                }
+            )
+            return {
+                'success': False,
+                'user_id': user_id,
+                'error': str(e)
+            }
+    
+    async def remove_from_blacklist(self, user_id: str) -> Dict[str, any]:
+        """
+        Manually remove a user from the blacklist
+        
+        Args:
+            user_id: User identifier to remove
+            
+        Returns:
+            Dict with success status and message
+            
+        Requirements: 5.2, 5.5
+        """
+        from .models import RecipientValidator
+        
+        # Validate user identifier format (Requirement 5.5)
+        validation_result = RecipientValidator.validate_recipient(user_id)
+        
+        if not validation_result.valid:
+            error_messages = [error.message for error in validation_result.errors]
+            self.logger.warning(
+                f"❌ Invalid user identifier for blacklist removal: {user_id}",
+                extra={
+                    'operation_type': 'manual_blacklist_remove',
+                    'user_id': user_id,
+                    'validation_errors': error_messages
+                }
+            )
+            return {
+                'success': False,
+                'user_id': user_id,
+                'error': f"Invalid user identifier: {'; '.join(error_messages)}"
+            }
+        
+        try:
+            # Remove from blacklist and persist (Requirement 5.2)
+            removed = await self.blacklist_manager.remove(user_id)
+            
+            if removed:
+                # Log manual operation (Requirement 1.4, 2.2, 6.5)
+                self.logger.info(
+                    f"✅ Manually removed user {user_id} from blacklist",
+                    extra={
+                        'operation_type': 'manual_blacklist_remove',
+                        'user_id': user_id,
+                        'admin_action': True
+                    }
+                )
+                
+                return {
+                    'success': True,
+                    'user_id': user_id,
+                    'message': f"User {user_id} removed from blacklist"
+                }
+            else:
+                self.logger.info(
+                    f"⚠️ User {user_id} not found in blacklist",
+                    extra={
+                        'operation_type': 'manual_blacklist_remove',
+                        'user_id': user_id,
+                        'found': False
+                    }
+                )
+                
+                return {
+                    'success': False,
+                    'user_id': user_id,
+                    'error': f"User {user_id} not found in blacklist"
+                }
+            
+        except Exception as e:
+            self.logger.error(
+                f"❌ Failed to remove user {user_id} from blacklist: {e}",
+                extra={
+                    'operation_type': 'manual_blacklist_remove',
+                    'user_id': user_id,
+                    'error': str(e)
+                }
+            )
+            return {
+                'success': False,
+                'user_id': user_id,
+                'error': str(e)
+            }
+    
+    async def get_blacklist(self) -> Dict[str, any]:
+        """
+        Get all blacklisted users with their metadata
+        
+        Returns:
+            Dict with success status and list of blacklist entries
+            
+        Requirements: 5.3
+        """
+        try:
+            # Get all entries (Requirement 5.3)
+            entries = await self.blacklist_manager.get_all()
+            
+            # Log view operation (Requirement 1.4, 2.2, 6.5)
+            self.logger.info(
+                f"📋 Retrieved blacklist with {len(entries)} entries",
+                extra={
+                    'operation_type': 'manual_blacklist_view',
+                    'entry_count': len(entries),
+                    'admin_action': True
+                }
+            )
+            
+            return {
+                'success': True,
+                'count': len(entries),
+                'entries': entries
+            }
+            
+        except Exception as e:
+            self.logger.error(
+                f"❌ Failed to retrieve blacklist: {e}",
+                extra={
+                    'operation_type': 'manual_blacklist_view',
+                    'error': str(e)
+                }
+            )
+            return {
+                'success': False,
+                'error': str(e),
+                'entries': []
+            }
+    
+    async def clear_blacklist(self) -> Dict[str, any]:
+        """
+        Clear the entire blacklist
+        
+        Returns:
+            Dict with success status and number of entries removed
+            
+        Requirements: 5.4
+        """
+        try:
+            # Clear blacklist and persist (Requirement 5.4)
+            count = await self.blacklist_manager.clear()
+            
+            # Log clear operation (Requirement 1.4, 2.2, 6.5)
+            self.logger.info(
+                f"🗑️ Cleared blacklist ({count} entries removed)",
+                extra={
+                    'operation_type': 'manual_blacklist_clear',
+                    'entries_removed': count,
+                    'admin_action': True
+                }
+            )
+            
+            return {
+                'success': True,
+                'entries_removed': count,
+                'message': f"Blacklist cleared ({count} entries removed)"
+            }
+            
+        except Exception as e:
+            self.logger.error(
+                f"❌ Failed to clear blacklist: {e}",
+                extra={
+                    'operation_type': 'manual_blacklist_clear',
+                    'error': str(e)
+                }
+            )
+            return {
+                'success': False,
+                'error': str(e)
+            }

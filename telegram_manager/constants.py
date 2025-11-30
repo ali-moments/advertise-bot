@@ -27,6 +27,12 @@ DAILY_GROUPS_LIMIT = int(os.getenv('DAILY_GROUPS_LIMIT', '10'))
 MONITORING_COOLDOWN = float(os.getenv('MONITORING_COOLDOWN', '2.0'))
 MESSAGE_SCRAPING_DAYS = int(os.getenv('MESSAGE_SCRAPING_DAYS', '10'))
 
+# Blacklist Configuration
+BLACKLIST_ENABLED = os.getenv('BLACKLIST_ENABLED', 'true').lower() == 'true'
+BLACKLIST_STORAGE_PATH = os.getenv('BLACKLIST_STORAGE_PATH', 'sessions/blacklist.json')
+BLACKLIST_FAILURE_THRESHOLD = int(os.getenv('BLACKLIST_FAILURE_THRESHOLD', '2'))
+BLACKLIST_AUTO_ADD = os.getenv('BLACKLIST_AUTO_ADD', 'true').lower() == 'true'
+
 # Validation
 if not APP_HASH or APP_HASH == 'YOUR_APP_HASH_HERE':
     raise ValueError("APP_HASH must be set in .env file")

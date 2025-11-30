@@ -1,9 +1,10 @@
 """
-Example: Bulk Message Sending with Load Balancing
+Example: Bulk Message Sending with Load Balancing and Blacklist Management
 
 This example demonstrates how to use the bulk message sending functionality
 to send text and media messages to multiple recipients with automatic load
-balancing across sessions.
+balancing across sessions. It also shows how the blacklist feature automatically
+prevents sending to users who have blocked the system.
 """
 
 import asyncio
@@ -267,6 +268,74 @@ async def example_load_balancing_strategies():
     await manager_ll.shutdown()
 
 
+async def example_blacklist_integration():
+    """Example: Automatic blacklist integration during bulk sending"""
+    logger.info("\n" + "=" * 60)
+    logger.info("Example 5: Blacklist Integration")
+    logger.info("=" * 60)
+    
+    # Initialize manager with blacklist enabled (default)
+    manager = TelegramSessionManager(max_concurrent_operations=3)
+    
+    # Load sessions
+    logger.info("Loading sessions from database...")
+    load_results = await manager.load_sessions_from_db()
+    logger.info(f"Loaded {sum(load_results.values())} sessions successfully")
+    
+    if not any(load_results.values()):
+        logger.error("No sessions loaded, cannot proceed")
+        return
+    
+    # Define recipients (some may be blacklisted)
+    recipients = [
+        'user123456',
+        'blocked_user1',  # This user might be blacklisted
+        'another_user',
+        'blocked_user2',  # This user might be blacklisted
+    ]
+    
+    message = "Test message with blacklist checking"
+    
+    # Check current blacklist status
+    logger.info("\n--- Checking Blacklist Status ---")
+    blacklist_result = await manager.get_blacklist()
+    if blacklist_result['success']:
+        logger.info(f"Current blacklist has {blacklist_result['count']} entries")
+        for entry in blacklist_result['entries']:
+            logger.info(f"  - {entry['user_id']} (added: {entry['timestamp']}, reason: {entry['reason']})")
+    
+    # Send messages - blacklisted users will be automatically skipped
+    logger.info("\n--- Sending Messages ---")
+    logger.info("The system will automatically skip any blacklisted users...")
+    results = await manager.send_text_messages_bulk(
+        recipients=recipients,
+        message=message,
+        delay=1.0
+    )
+    
+    # Show results with blacklist information
+    logger.info("\n--- Results ---")
+    for recipient, result in results.items():
+        if result.blacklisted:
+            logger.info(f"  ⏭️ {recipient}: SKIPPED (blacklisted)")
+        elif result.success:
+            logger.info(f"  ✅ {recipient}: SUCCESS (via {result.session_used})")
+        else:
+            logger.info(f"  ❌ {recipient}: FAILED ({result.error})")
+    
+    # Note: If a user blocks us during sending, after 2 consecutive failures,
+    # they will be automatically added to the blacklist and future sends will be skipped
+    
+    logger.info("\n--- Blacklist Feature Notes ---")
+    logger.info("• Users are automatically blacklisted after 2 consecutive delivery failures")
+    logger.info("• Blacklisted users are skipped before attempting delivery")
+    logger.info("• The blacklist persists across system restarts")
+    logger.info("• You can manually manage the blacklist using the API (see blacklist_management_example.py)")
+    
+    # Shutdown
+    await manager.shutdown()
+
+
 async def main():
     """Run all examples"""
     try:
@@ -277,6 +346,7 @@ async def main():
         # await example_media_messages()
         # await example_mixed_recipients()
         # await example_load_balancing_strategies()
+        # await example_blacklist_integration()
         
     except Exception as e:
         logger.error(f"Error running examples: {e}", exc_info=True)
