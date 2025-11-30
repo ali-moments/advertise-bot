@@ -79,6 +79,10 @@ class TestTelegramSessionAPICompatibility:
         
         For any TelegramSession, get_status should return a Dict with
         consistent structure (Requirements 8.3, 8.5).
+        
+        Updated to include new fields from concurrent operations architecture:
+        - current_operation: tracks active scraping/sending operation
+        - operation_start_time: tracks when operation started
         """
         session = TelegramSession(
             session_file='test_status.session',
@@ -94,8 +98,15 @@ class TestTelegramSessionAPICompatibility:
             f"get_status should return Dict, got {type(status)}"
         
         # Verify expected keys are present (Requirements 8.5)
-        # The actual keys returned by get_status
-        expected_keys = {'connected', 'monitoring', 'monitoring_targets_count', 'active_tasks'}
+        # Updated to include new operation tracking fields (AC-7.1, AC-7.2)
+        expected_keys = {
+            'connected', 
+            'monitoring', 
+            'monitoring_targets_count', 
+            'active_tasks',
+            'current_operation',  # New: tracks scraping/sending operations
+            'operation_start_time'  # New: tracks operation timing
+        }
         actual_keys = set(status.keys())
         
         assert expected_keys == actual_keys, \
@@ -151,14 +162,17 @@ class TestTelegramSessionManagerAPICompatibility:
         
         For any valid max_concurrent_operations value, the __init__ method
         should accept this parameter and create a valid instance (Requirements 8.2).
+        
+        Note: load_balancing_strategy parameter was added in Task 10 (Requirement 19.1-19.5)
         """
         # Verify signature
         sig = inspect.signature(TelegramSessionManager.__init__)
         params = list(sig.parameters.keys())
         
-        # Expected parameters (Requirements 8.2)
-        assert params == ['self', 'max_concurrent_operations'], \
-            f"TelegramSessionManager.__init__ signature changed. Expected ['self', 'max_concurrent_operations'], got {params}"
+        # Expected parameters (Requirements 8.2, 19.1-19.5)
+        # load_balancing_strategy was added in Task 10
+        assert params == ['self', 'max_concurrent_operations', 'load_balancing_strategy'], \
+            f"TelegramSessionManager.__init__ signature changed. Expected ['self', 'max_concurrent_operations', 'load_balancing_strategy'], got {params}"
         
         # Verify we can create instance
         try:

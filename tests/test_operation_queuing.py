@@ -108,11 +108,11 @@ async def test_operation_priority_ordering():
     # Acquire lock to force queuing
     await session.operation_lock.acquire()
     
-    # Submit operations in reverse priority order
+    # Submit operations in reverse priority order (scraping has higher priority than sending)
     tasks = [
         asyncio.create_task(session._submit_operation('sending', track_operation, 'sending')),
         asyncio.create_task(session._submit_operation('scraping', track_operation, 'scraping')),
-        asyncio.create_task(session._submit_operation('monitoring', track_operation, 'monitoring')),
+        asyncio.create_task(session._submit_operation('sending', track_operation, 'sending2')),
     ]
     
     # Wait for all to be queued
@@ -124,14 +124,13 @@ async def test_operation_priority_ordering():
     # Wait for all to complete
     await asyncio.gather(*tasks)
     
-    # Should execute in priority order: monitoring (10) > scraping (5) > sending (1)
+    # Should execute in priority order: scraping (5) > sending (1)
     # Note: The queue processor processes in FIFO order within same priority
-    # Since we're using asyncio.Queue, not PriorityQueue, order may vary
     # This test verifies they all complete successfully
     assert len(execution_order) == 3
-    assert 'monitoring' in execution_order
     assert 'scraping' in execution_order
     assert 'sending' in execution_order
+    assert 'sending2' in execution_order
     
     # Cleanup
     session.is_connected = False
@@ -192,3 +191,48 @@ async def test_join_and_scrape_uses_queuing():
     assert result['success'] is True
     assert result['joined'] is True
     assert result['members_count'] == 50
+
+
+@pytest.mark.asyncio
+async def test_submit_operation_rejects_monitoring():
+    """
+    Test that _submit_operation rejects 'monitoring' operation type
+    
+    Validates: AC-5.1, AC-5.2
+    """
+    session = TelegramSession("test.session", 12345, "test_hash")
+    session.is_connected = True
+    
+    async def mock_operation():
+        return "should_not_execute"
+    
+    # Attempt to submit monitoring operation - should raise ValueError
+    with pytest.raises(ValueError) as exc_info:
+        await session._submit_operation('monitoring', mock_operation)
+    
+    # Verify error message is clear
+    assert 'monitoring' in str(exc_info.value).lower()
+    assert 'scraping' in str(exc_info.value).lower() or 'sending' in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_submit_operation_accepts_scraping_sending():
+    """
+    Test that _submit_operation accepts 'scraping' and 'sending' operation types
+    
+    Validates: AC-5.1
+    """
+    session = TelegramSession("test.session", 12345, "test_hash")
+    session.is_connected = True
+    
+    async def mock_operation(op_type):
+        await asyncio.sleep(0.05)
+        return f"executed_{op_type}"
+    
+    # Submit scraping operation - should succeed
+    result_scraping = await session._submit_operation('scraping', mock_operation, 'scraping')
+    assert result_scraping == "executed_scraping"
+    
+    # Submit sending operation - should succeed
+    result_sending = await session._submit_operation('sending', mock_operation, 'sending')
+    assert result_sending == "executed_sending"

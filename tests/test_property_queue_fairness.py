@@ -1,374 +1,571 @@
 """
-Property-Based Test for Operation Queue Fairness
+Property-Based Test for FIFO within Priority
 
-**Feature: telegram-concurrency-fix, Property 8: Operation queue fairness**
+**Feature: message-sending-and-multi-reaction, Property 33: FIFO within priority**
 
-Tests that for any session with queued operations, operations should be processed 
-in priority order (monitoring > scraping > sending), and within the same priority, 
-in FIFO order, with each operation timing out if not started within the queue wait timeout.
+Tests that for any set of operations with equal priority, they should be 
+processed in the order they were enqueued (First-In-First-Out).
 
-**Validates: Requirements 1.4**
+**Validates: Requirements 21.4**
 """
 
-import asyncio
 import pytest
-import time
 from hypothesis import given, strategies as st, settings, assume
-from telegram_manager.session import TelegramSession, QueuedOperation
+from telegram_manager.models import OperationQueue, QueuedOperation, OperationPriority
+import time
 
 
-# Strategy for generating lists of operations with different priorities
+# Strategies for generating test data
+
 @st.composite
-def operation_sequence(draw):
-    """Generate a sequence of operations with various types"""
-    # Generate 3-10 operations
-    num_ops = draw(st.integers(min_value=3, max_value=10))
+def operations_with_same_priority(draw, priority=None, min_size=2, max_size=50):
+    """Generate a list of operations with the same priority"""
+    if priority is None:
+        priority = draw(st.sampled_from([
+            OperationPriority.HIGH,
+            OperationPriority.NORMAL,
+            OperationPriority.LOW
+        ]))
     
+    size = draw(st.integers(min_value=min_size, max_value=max_size))
     operations = []
-    for i in range(num_ops):
-        op_type = draw(st.sampled_from(['monitoring', 'scraping', 'sending']))
-        duration = draw(st.floats(min_value=0.01, max_value=0.1))
-        operations.append({
-            'id': i,
-            'type': op_type,
-            'duration': duration
-        })
     
-    return operations
+    for i in range(size):
+        operation_id = f"op_{priority.name}_{i}"
+        operations.append(QueuedOperation(
+            operation_id=operation_id,
+            priority=priority,
+            operation_func=lambda: None,
+            args=(),
+            kwargs={},
+            timestamp=time.time() + i * 0.001  # Ensure unique timestamps
+        ))
+    
+    return operations, priority
 
 
-@pytest.mark.asyncio
-@given(ops=operation_sequence())
-@settings(max_examples=100, deadline=None)
-async def test_property_operation_queue_fairness(ops):
+@st.composite
+def mixed_operations_per_priority(draw, min_per_priority=2, max_per_priority=30):
     """
-    Property Test: Operation queue fairness
-    
-    For any session with queued operations, operations should be processed in priority 
-    order (monitoring=10 > scraping=5 > sending=1), and within the same priority, 
-    in FIFO order.
-    
-    Test Strategy:
-    1. Create a session and start queue processor
-    2. Acquire the operation lock to force all operations to queue
-    3. Submit multiple operations with different priorities
-    4. Release the lock and let queue processor handle them
-    5. Verify execution order respects priority and FIFO within priority
+    Generate operations with multiple operations at each priority level.
+    Returns dict mapping priority to list of operations.
     """
-    # Skip if we have too few operations to test ordering
-    assume(len(ops) >= 3)
+    result = {}
     
-    # Create a test session
-    session = TelegramSession(
-        session_file='test_queue_fairness.session',
-        api_id=12345,
-        api_hash='test_hash'
-    )
-    session.is_connected = True
+    for priority in [OperationPriority.HIGH, OperationPriority.NORMAL, OperationPriority.LOW]:
+        count = draw(st.integers(min_value=min_per_priority, max_value=max_per_priority))
+        operations = []
+        
+        for i in range(count):
+            operations.append(QueuedOperation(
+                operation_id=f"op_{priority.name}_{i}",
+                priority=priority,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={},
+                timestamp=time.time() + i * 0.001
+            ))
+        
+        result[priority] = operations
     
-    # Start queue processor
-    session.queue_processor_task = asyncio.create_task(session._process_operation_queue())
+    return result
+
+
+class TestFIFOWithinPriorityProperty:
+    """Property tests for FIFO ordering within same priority level"""
     
-    # Track execution order
-    execution_order = []
-    execution_lock = asyncio.Lock()
+    @given(ops_data=operations_with_same_priority(min_size=2, max_size=50))
+    @settings(max_examples=100, deadline=None)
+    def test_property_fifo_same_priority(self, ops_data):
+        """
+        Property: Operations with same priority are dequeued in FIFO order
+        
+        For any sequence of operations with the same priority level, when all
+        operations are enqueued and then dequeued, they should be returned in
+        the exact same order they were enqueued (First-In-First-Out).
+        
+        **Validates: Requirements 21.4**
+        """
+        operations, priority = ops_data
+        assume(len(operations) >= 2)
+        
+        # Create queue and enqueue all operations
+        queue = OperationQueue()
+        for op in operations:
+            queue.enqueue(op)
+        
+        # Dequeue all operations
+        dequeued = []
+        while not queue.is_empty():
+            op = queue.dequeue()
+            if op is not None:
+                dequeued.append(op)
+        
+        # Verify all operations were dequeued
+        assert len(dequeued) == len(operations), \
+            f"Expected {len(operations)} operations, got {len(dequeued)}"
+        
+        # Verify FIFO order: dequeued order should match enqueued order
+        for i, (original, dequeued_op) in enumerate(zip(operations, dequeued)):
+            assert original.operation_id == dequeued_op.operation_id, \
+                f"FIFO violation at position {i}: expected {original.operation_id}, " \
+                f"got {dequeued_op.operation_id}"
+            assert original.priority == dequeued_op.priority, \
+                f"Priority mismatch at position {i}"
     
-    async def mock_operation(op_id: int, op_type: str, duration: float):
-        """Mock operation that records execution"""
-        async with execution_lock:
-            execution_order.append({
-                'id': op_id,
-                'type': op_type,
-                'timestamp': time.time()
-            })
-        await asyncio.sleep(duration)
-        return f"result_{op_id}"
+    @given(ops_by_priority=mixed_operations_per_priority(min_per_priority=2, max_per_priority=30))
+    @settings(max_examples=100, deadline=None)
+    def test_property_fifo_within_each_priority_level(self, ops_by_priority):
+        """
+        Property: FIFO ordering is maintained within each priority level independently
+        
+        For any set of operations with mixed priorities, when operations are
+        enqueued and dequeued, the relative order of operations within each
+        priority level should be preserved (FIFO).
+        
+        **Validates: Requirements 21.4**
+        """
+        # Flatten all operations into a single list for enqueueing
+        all_operations = []
+        for priority in [OperationPriority.HIGH, OperationPriority.NORMAL, OperationPriority.LOW]:
+            all_operations.extend(ops_by_priority[priority])
+        
+        assume(len(all_operations) >= 6)  # At least 2 per priority
+        
+        # Create queue and enqueue all operations
+        queue = OperationQueue()
+        for op in all_operations:
+            queue.enqueue(op)
+        
+        # Dequeue all operations
+        dequeued = []
+        while not queue.is_empty():
+            op = queue.dequeue()
+            if op is not None:
+                dequeued.append(op)
+        
+        # Verify all operations were dequeued
+        assert len(dequeued) == len(all_operations)
+        
+        # Extract operations by priority from dequeued list
+        dequeued_by_priority = {
+            OperationPriority.HIGH: [],
+            OperationPriority.NORMAL: [],
+            OperationPriority.LOW: []
+        }
+        
+        for op in dequeued:
+            dequeued_by_priority[op.priority].append(op)
+        
+        # Verify FIFO order within each priority level
+        for priority in [OperationPriority.HIGH, OperationPriority.NORMAL, OperationPriority.LOW]:
+            original_ops = ops_by_priority[priority]
+            dequeued_ops = dequeued_by_priority[priority]
+            
+            assert len(original_ops) == len(dequeued_ops), \
+                f"Count mismatch for {priority}: expected {len(original_ops)}, " \
+                f"got {len(dequeued_ops)}"
+            
+            # Verify FIFO order for this priority level
+            for i, (original, dequeued_op) in enumerate(zip(original_ops, dequeued_ops)):
+                assert original.operation_id == dequeued_op.operation_id, \
+                    f"FIFO violation for {priority} at position {i}: " \
+                    f"expected {original.operation_id}, got {dequeued_op.operation_id}"
     
-    # Acquire lock to force queuing
-    await session.operation_lock.acquire()
-    
-    # Small delay to ensure lock is fully acquired and queue processor is waiting
-    await asyncio.sleep(0.01)
-    
-    # Submit all operations (they will be queued)
-    submission_order = []
-    tasks = []
-    for op in ops:
-        submission_order.append({
-            'id': op['id'],
-            'type': op['type']
-        })
-        task = asyncio.create_task(
-            session._submit_operation(
-                op['type'],
-                mock_operation,
-                op['id'],
-                op['type'],
-                op['duration']
+    @given(data=st.data())
+    @settings(max_examples=100, deadline=None)
+    def test_property_fifo_high_priority_operations(self, data):
+        """
+        Property: HIGH priority operations maintain FIFO order
+        
+        For any sequence of HIGH priority operations, regardless of when they
+        are enqueued relative to other priorities, they should be dequeued in
+        the order they were enqueued.
+        
+        **Validates: Requirements 21.4**
+        """
+        # Generate HIGH priority operations
+        high_count = data.draw(st.integers(min_value=3, max_value=20))
+        high_ops = [
+            QueuedOperation(
+                operation_id=f"high_{i}",
+                priority=OperationPriority.HIGH,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={},
+                timestamp=time.time() + i * 0.001
             )
-        )
-        tasks.append(task)
-        # Small delay to ensure operations are submitted in order
-        await asyncio.sleep(0.001)
+            for i in range(high_count)
+        ]
+        
+        # Generate some NORMAL and LOW priority operations to mix in
+        normal_count = data.draw(st.integers(min_value=1, max_value=10))
+        low_count = data.draw(st.integers(min_value=1, max_value=10))
+        
+        normal_ops = [
+            QueuedOperation(
+                operation_id=f"normal_{i}",
+                priority=OperationPriority.NORMAL,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={}
+            )
+            for i in range(normal_count)
+        ]
+        
+        low_ops = [
+            QueuedOperation(
+                operation_id=f"low_{i}",
+                priority=OperationPriority.LOW,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={}
+            )
+            for i in range(low_count)
+        ]
+        
+        # Create queue and enqueue operations in interleaved manner
+        queue = OperationQueue()
+        
+        # Enqueue in a mixed pattern
+        for i in range(max(high_count, normal_count, low_count)):
+            if i < high_count:
+                queue.enqueue(high_ops[i])
+            if i < normal_count:
+                queue.enqueue(normal_ops[i])
+            if i < low_count:
+                queue.enqueue(low_ops[i])
+        
+        # Dequeue all operations
+        dequeued = []
+        while not queue.is_empty():
+            op = queue.dequeue()
+            if op is not None:
+                dequeued.append(op)
+        
+        # Extract HIGH priority operations from dequeued list
+        dequeued_high = [op for op in dequeued if op.priority == OperationPriority.HIGH]
+        
+        # Verify FIFO order for HIGH priority operations
+        assert len(dequeued_high) == len(high_ops), \
+            f"Expected {len(high_ops)} HIGH priority operations, got {len(dequeued_high)}"
+        
+        for i, (original, dequeued_op) in enumerate(zip(high_ops, dequeued_high)):
+            assert original.operation_id == dequeued_op.operation_id, \
+                f"FIFO violation for HIGH priority at position {i}: " \
+                f"expected {original.operation_id}, got {dequeued_op.operation_id}"
     
-    # Wait for all operations to be queued
-    await asyncio.sleep(0.05)
+    @given(data=st.data())
+    @settings(max_examples=100, deadline=None)
+    def test_property_fifo_normal_priority_operations(self, data):
+        """
+        Property: NORMAL priority operations maintain FIFO order
+        
+        For any sequence of NORMAL priority operations, they should be dequeued
+        in the order they were enqueued, after all HIGH priority operations.
+        
+        **Validates: Requirements 21.4**
+        """
+        # Generate NORMAL priority operations
+        normal_count = data.draw(st.integers(min_value=3, max_value=20))
+        normal_ops = [
+            QueuedOperation(
+                operation_id=f"normal_{i}",
+                priority=OperationPriority.NORMAL,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={},
+                timestamp=time.time() + i * 0.001
+            )
+            for i in range(normal_count)
+        ]
+        
+        # Generate some HIGH and LOW priority operations
+        high_count = data.draw(st.integers(min_value=1, max_value=10))
+        low_count = data.draw(st.integers(min_value=1, max_value=10))
+        
+        high_ops = [
+            QueuedOperation(
+                operation_id=f"high_{i}",
+                priority=OperationPriority.HIGH,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={}
+            )
+            for i in range(high_count)
+        ]
+        
+        low_ops = [
+            QueuedOperation(
+                operation_id=f"low_{i}",
+                priority=OperationPriority.LOW,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={}
+            )
+            for i in range(low_count)
+        ]
+        
+        # Create queue and enqueue operations in interleaved manner
+        queue = OperationQueue()
+        
+        for i in range(max(high_count, normal_count, low_count)):
+            if i < high_count:
+                queue.enqueue(high_ops[i])
+            if i < normal_count:
+                queue.enqueue(normal_ops[i])
+            if i < low_count:
+                queue.enqueue(low_ops[i])
+        
+        # Dequeue all operations
+        dequeued = []
+        while not queue.is_empty():
+            op = queue.dequeue()
+            if op is not None:
+                dequeued.append(op)
+        
+        # Extract NORMAL priority operations from dequeued list
+        dequeued_normal = [op for op in dequeued if op.priority == OperationPriority.NORMAL]
+        
+        # Verify FIFO order for NORMAL priority operations
+        assert len(dequeued_normal) == len(normal_ops), \
+            f"Expected {len(normal_ops)} NORMAL priority operations, got {len(dequeued_normal)}"
+        
+        for i, (original, dequeued_op) in enumerate(zip(normal_ops, dequeued_normal)):
+            assert original.operation_id == dequeued_op.operation_id, \
+                f"FIFO violation for NORMAL priority at position {i}: " \
+                f"expected {original.operation_id}, got {dequeued_op.operation_id}"
     
-    # Release lock to start processing
-    session.operation_lock.release()
+    @given(data=st.data())
+    @settings(max_examples=100, deadline=None)
+    def test_property_fifo_low_priority_operations(self, data):
+        """
+        Property: LOW priority operations maintain FIFO order
+        
+        For any sequence of LOW priority operations, they should be dequeued
+        in the order they were enqueued, after all HIGH and NORMAL priority operations.
+        
+        **Validates: Requirements 21.4**
+        """
+        # Generate LOW priority operations
+        low_count = data.draw(st.integers(min_value=3, max_value=20))
+        low_ops = [
+            QueuedOperation(
+                operation_id=f"low_{i}",
+                priority=OperationPriority.LOW,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={},
+                timestamp=time.time() + i * 0.001
+            )
+            for i in range(low_count)
+        ]
+        
+        # Generate some HIGH and NORMAL priority operations
+        high_count = data.draw(st.integers(min_value=1, max_value=10))
+        normal_count = data.draw(st.integers(min_value=1, max_value=10))
+        
+        high_ops = [
+            QueuedOperation(
+                operation_id=f"high_{i}",
+                priority=OperationPriority.HIGH,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={}
+            )
+            for i in range(high_count)
+        ]
+        
+        normal_ops = [
+            QueuedOperation(
+                operation_id=f"normal_{i}",
+                priority=OperationPriority.NORMAL,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={}
+            )
+            for i in range(normal_count)
+        ]
+        
+        # Create queue and enqueue operations in interleaved manner
+        queue = OperationQueue()
+        
+        for i in range(max(high_count, normal_count, low_count)):
+            if i < high_count:
+                queue.enqueue(high_ops[i])
+            if i < normal_count:
+                queue.enqueue(normal_ops[i])
+            if i < low_count:
+                queue.enqueue(low_ops[i])
+        
+        # Dequeue all operations
+        dequeued = []
+        while not queue.is_empty():
+            op = queue.dequeue()
+            if op is not None:
+                dequeued.append(op)
+        
+        # Extract LOW priority operations from dequeued list
+        dequeued_low = [op for op in dequeued if op.priority == OperationPriority.LOW]
+        
+        # Verify FIFO order for LOW priority operations
+        assert len(dequeued_low) == len(low_ops), \
+            f"Expected {len(low_ops)} LOW priority operations, got {len(dequeued_low)}"
+        
+        for i, (original, dequeued_op) in enumerate(zip(low_ops, dequeued_low)):
+            assert original.operation_id == dequeued_op.operation_id, \
+                f"FIFO violation for LOW priority at position {i}: " \
+                f"expected {original.operation_id}, got {dequeued_op.operation_id}"
     
-    # Wait for all operations to complete
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True),
-            timeout=10.0
-        )
-    except asyncio.TimeoutError:
-        pytest.fail("Operations timed out during execution")
+    @given(ops_data=operations_with_same_priority(min_size=5, max_size=50))
+    @settings(max_examples=100, deadline=None)
+    def test_property_fifo_partial_dequeue(self, ops_data):
+        """
+        Property: FIFO order is maintained even with partial dequeuing
+        
+        For any sequence of operations with the same priority, if we dequeue
+        some operations, then enqueue more, then dequeue again, the overall
+        order should still respect FIFO for operations at the same priority.
+        
+        **Validates: Requirements 21.4**
+        """
+        operations, priority = ops_data
+        assume(len(operations) >= 5)
+        
+        # Split operations into two batches
+        split_point = len(operations) // 2
+        first_batch = operations[:split_point]
+        second_batch = operations[split_point:]
+        
+        # Create queue and enqueue first batch
+        queue = OperationQueue()
+        for op in first_batch:
+            queue.enqueue(op)
+        
+        # Dequeue half of first batch
+        partial_dequeue_count = len(first_batch) // 2
+        first_dequeued = []
+        for _ in range(partial_dequeue_count):
+            op = queue.dequeue()
+            if op is not None:
+                first_dequeued.append(op)
+        
+        # Enqueue second batch
+        for op in second_batch:
+            queue.enqueue(op)
+        
+        # Dequeue remaining operations
+        remaining_dequeued = []
+        while not queue.is_empty():
+            op = queue.dequeue()
+            if op is not None:
+                remaining_dequeued.append(op)
+        
+        # Combine all dequeued operations
+        all_dequeued = first_dequeued + remaining_dequeued
+        
+        # Verify FIFO order is maintained
+        assert len(all_dequeued) == len(operations), \
+            f"Expected {len(operations)} operations, got {len(all_dequeued)}"
+        
+        for i, (original, dequeued_op) in enumerate(zip(operations, all_dequeued)):
+            assert original.operation_id == dequeued_op.operation_id, \
+                f"FIFO violation at position {i}: expected {original.operation_id}, " \
+                f"got {dequeued_op.operation_id}"
     
-    # Cleanup
-    session.is_connected = False
-    if session.queue_processor_task and not session.queue_processor_task.done():
-        session.queue_processor_task.cancel()
-        try:
-            await asyncio.wait_for(session.queue_processor_task, timeout=1.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
+    @given(data=st.data())
+    @settings(max_examples=100, deadline=None)
+    def test_property_fifo_timestamp_order(self, data):
+        """
+        Property: Operations are dequeued in timestamp order within same priority
+        
+        For any sequence of operations with the same priority and sequential
+        timestamps, they should be dequeued in timestamp order (which is FIFO).
+        
+        **Validates: Requirements 21.4**
+        """
+        priority = data.draw(st.sampled_from([
+            OperationPriority.HIGH,
+            OperationPriority.NORMAL,
+            OperationPriority.LOW
+        ]))
+        
+        count = data.draw(st.integers(min_value=3, max_value=30))
+        
+        # Create operations with sequential timestamps
+        base_time = time.time()
+        operations = []
+        for i in range(count):
+            operations.append(QueuedOperation(
+                operation_id=f"op_{i}",
+                priority=priority,
+                operation_func=lambda: None,
+                args=(),
+                kwargs={},
+                timestamp=base_time + i * 0.01  # 10ms apart
+            ))
+        
+        # Create queue and enqueue all operations
+        queue = OperationQueue()
+        for op in operations:
+            queue.enqueue(op)
+        
+        # Dequeue all operations
+        dequeued = []
+        while not queue.is_empty():
+            op = queue.dequeue()
+            if op is not None:
+                dequeued.append(op)
+        
+        # Verify operations are dequeued in timestamp order
+        assert len(dequeued) == len(operations)
+        
+        for i in range(len(dequeued) - 1):
+            assert dequeued[i].timestamp <= dequeued[i + 1].timestamp, \
+                f"Timestamp order violation: operation at index {i} has timestamp " \
+                f"{dequeued[i].timestamp}, but operation at index {i+1} has timestamp " \
+                f"{dequeued[i+1].timestamp}"
     
-    # Verify all operations completed
-    assert len(execution_order) == len(ops), \
-        f"Expected {len(ops)} operations to execute, but got {len(execution_order)}"
-    
-    # Property verification: Check priority ordering
-    # Group operations by priority
-    priority_map = {
-        'monitoring': 10,
-        'scraping': 5,
-        'sending': 1
-    }
-    
-    # Build expected order: sort by priority (descending), then by submission order (FIFO)
-    expected_order = sorted(
-        submission_order,
-        key=lambda x: (-priority_map[x['type']], submission_order.index(x))
-    )
-    
-    # Extract just the IDs from execution order
-    actual_ids = [e['id'] for e in execution_order]
-    expected_ids = [e['id'] for e in expected_order]
-    
-    # Verify the order matches expected priority + FIFO ordering
-    # Note: Due to asyncio scheduling, exact FIFO within same priority may vary slightly
-    # So we verify priority ordering is strictly maintained
-    
-    # Check that higher priority operations execute before lower priority ones
-    monitoring_indices = [i for i, e in enumerate(execution_order) if e['type'] == 'monitoring']
-    scraping_indices = [i for i, e in enumerate(execution_order) if e['type'] == 'scraping']
-    sending_indices = [i for i, e in enumerate(execution_order) if e['type'] == 'sending']
-    
-    # All monitoring operations should execute before all scraping operations
-    if monitoring_indices and scraping_indices:
-        max_monitoring_idx = max(monitoring_indices)
-        min_scraping_idx = min(scraping_indices)
-        assert max_monitoring_idx < min_scraping_idx, \
-            f"Priority violation: monitoring operations should execute before scraping. " \
-            f"Last monitoring at index {max_monitoring_idx}, first scraping at {min_scraping_idx}. " \
-            f"Execution order: {execution_order}"
-    
-    # All monitoring operations should execute before all sending operations
-    if monitoring_indices and sending_indices:
-        max_monitoring_idx = max(monitoring_indices)
-        min_sending_idx = min(sending_indices)
-        assert max_monitoring_idx < min_sending_idx, \
-            f"Priority violation: monitoring operations should execute before sending. " \
-            f"Last monitoring at index {max_monitoring_idx}, first sending at {min_sending_idx}. " \
-            f"Execution order: {execution_order}"
-    
-    # All scraping operations should execute before all sending operations
-    if scraping_indices and sending_indices:
-        max_scraping_idx = max(scraping_indices)
-        min_sending_idx = min(sending_indices)
-        assert max_scraping_idx < min_sending_idx, \
-            f"Priority violation: scraping operations should execute before sending. " \
-            f"Last scraping at index {max_scraping_idx}, first sending at {min_sending_idx}. " \
-            f"Execution order: {execution_order}"
-
-
-@pytest.mark.asyncio
-async def test_queue_fairness_simple_example():
-    """
-    Simple example test to verify basic queue fairness with specific operations
-    
-    This is a concrete example that demonstrates the property with known values.
-    """
-    session = TelegramSession(
-        session_file='test_simple_queue.session',
-        api_id=12345,
-        api_hash='test_hash'
-    )
-    session.is_connected = True
-    
-    # Start queue processor
-    session.queue_processor_task = asyncio.create_task(session._process_operation_queue())
-    
-    execution_order = []
-    
-    async def mock_operation(op_name: str):
-        """Mock operation"""
-        execution_order.append(op_name)
-        await asyncio.sleep(0.05)
-        return op_name
-    
-    # Acquire lock to force queuing
-    await session.operation_lock.acquire()
-    
-    # Submit operations in this order: sending, scraping, monitoring
-    # Expected execution order: monitoring, scraping, sending (by priority)
-    tasks = [
-        asyncio.create_task(session._submit_operation('sending', mock_operation, 'sending_1')),
-        asyncio.create_task(session._submit_operation('scraping', mock_operation, 'scraping_1')),
-        asyncio.create_task(session._submit_operation('monitoring', mock_operation, 'monitoring_1')),
-    ]
-    
-    # Wait for all to be queued
-    await asyncio.sleep(0.05)
-    
-    # Release lock
-    session.operation_lock.release()
-    
-    # Wait for completion
-    await asyncio.gather(*tasks)
-    
-    # Cleanup
-    session.is_connected = False
-    session.queue_processor_task.cancel()
-    try:
-        await asyncio.wait_for(session.queue_processor_task, timeout=1.0)
-    except (asyncio.CancelledError, asyncio.TimeoutError):
-        pass
-    
-    # Verify priority order: monitoring should execute first, then scraping, then sending
-    assert execution_order == ['monitoring_1', 'scraping_1', 'sending_1'], \
-        f"Expected priority order [monitoring, scraping, sending], got {execution_order}"
-
-
-@pytest.mark.asyncio
-async def test_queue_fairness_fifo_within_priority():
-    """
-    Test FIFO ordering within the same priority level
-    
-    Verifies that operations with the same priority execute in submission order.
-    """
-    session = TelegramSession(
-        session_file='test_fifo.session',
-        api_id=12345,
-        api_hash='test_hash'
-    )
-    session.is_connected = True
-    
-    # Start queue processor
-    session.queue_processor_task = asyncio.create_task(session._process_operation_queue())
-    
-    execution_order = []
-    
-    async def mock_operation(op_name: str):
-        """Mock operation"""
-        execution_order.append(op_name)
-        await asyncio.sleep(0.02)
-        return op_name
-    
-    # Acquire lock to force queuing
-    await session.operation_lock.acquire()
-    
-    # Submit multiple scraping operations (same priority)
-    # They should execute in FIFO order
-    tasks = [
-        asyncio.create_task(session._submit_operation('scraping', mock_operation, 'scraping_1')),
-        asyncio.create_task(session._submit_operation('scraping', mock_operation, 'scraping_2')),
-        asyncio.create_task(session._submit_operation('scraping', mock_operation, 'scraping_3')),
-    ]
-    
-    # Small delays to ensure submission order
-    await asyncio.sleep(0.05)
-    
-    # Release lock
-    session.operation_lock.release()
-    
-    # Wait for completion
-    await asyncio.gather(*tasks)
-    
-    # Cleanup
-    session.is_connected = False
-    session.queue_processor_task.cancel()
-    try:
-        await asyncio.wait_for(session.queue_processor_task, timeout=1.0)
-    except (asyncio.CancelledError, asyncio.TimeoutError):
-        pass
-    
-    # Verify FIFO order within same priority
-    assert execution_order == ['scraping_1', 'scraping_2', 'scraping_3'], \
-        f"Expected FIFO order [scraping_1, scraping_2, scraping_3], got {execution_order}"
-
-
-@pytest.mark.asyncio
-async def test_queue_timeout_handling():
-    """
-    Test that operations timeout if they wait too long in the queue
-    
-    Verifies the queue wait timeout mechanism.
-    """
-    session = TelegramSession(
-        session_file='test_timeout.session',
-        api_id=12345,
-        api_hash='test_hash'
-    )
-    session.is_connected = True
-    session.queue_wait_timeout = 0.5  # Set short timeout for testing
-    
-    # Start queue processor
-    session.queue_processor_task = asyncio.create_task(session._process_operation_queue())
-    
-    async def slow_operation():
-        """Operation that takes a long time"""
-        await asyncio.sleep(1.0)
-        return "slow_result"
-    
-    async def quick_operation():
-        """Quick operation"""
-        await asyncio.sleep(0.01)
-        return "quick_result"
-    
-    # Acquire lock to force queuing
-    await session.operation_lock.acquire()
-    
-    # Submit operations
-    task1 = asyncio.create_task(session._submit_operation('scraping', slow_operation))
-    task2 = asyncio.create_task(session._submit_operation('scraping', quick_operation))
-    
-    # Wait for operations to be queued
-    await asyncio.sleep(0.1)
-    
-    # Release lock after a delay that will cause task2 to timeout
-    await asyncio.sleep(0.6)
-    session.operation_lock.release()
-    
-    # Wait for tasks
-    results = await asyncio.gather(task1, task2, return_exceptions=True)
-    
-    # Cleanup
-    session.is_connected = False
-    session.queue_processor_task.cancel()
-    try:
-        await asyncio.wait_for(session.queue_processor_task, timeout=1.0)
-    except (asyncio.CancelledError, asyncio.TimeoutError):
-        pass
-    
-    # At least one operation should have timed out
-    # Note: This test verifies the timeout mechanism exists
-    # The exact behavior depends on timing, so we just check for TimeoutError
-    has_timeout = any(isinstance(r, TimeoutError) for r in results)
-    assert has_timeout or any(isinstance(r, Exception) for r in results), \
-        f"Expected at least one timeout or error, got: {results}"
+    @given(ops_data=operations_with_same_priority(min_size=2, max_size=50))
+    @settings(max_examples=100, deadline=None)
+    def test_property_fifo_no_reordering(self, ops_data):
+        """
+        Property: No reordering occurs within same priority
+        
+        For any sequence of operations with the same priority, the dequeue
+        order should be a permutation that preserves the original order
+        (i.e., no inversions).
+        
+        **Validates: Requirements 21.4**
+        """
+        operations, priority = ops_data
+        assume(len(operations) >= 2)
+        
+        # Create queue and enqueue all operations
+        queue = OperationQueue()
+        for op in operations:
+            queue.enqueue(op)
+        
+        # Dequeue all operations
+        dequeued = []
+        while not queue.is_empty():
+            op = queue.dequeue()
+            if op is not None:
+                dequeued.append(op)
+        
+        # Create mapping of operation_id to original index
+        original_indices = {op.operation_id: i for i, op in enumerate(operations)}
+        
+        # Verify no inversions in dequeued order
+        for i in range(len(dequeued) - 1):
+            current_original_idx = original_indices[dequeued[i].operation_id]
+            next_original_idx = original_indices[dequeued[i + 1].operation_id]
+            
+            assert current_original_idx < next_original_idx, \
+                f"Inversion detected: operation '{dequeued[i].operation_id}' " \
+                f"(original index {current_original_idx}) comes before " \
+                f"'{dequeued[i+1].operation_id}' (original index {next_original_idx}), " \
+                f"but should come after"
 
 
 if __name__ == '__main__':

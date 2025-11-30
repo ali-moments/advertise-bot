@@ -3,8 +3,9 @@ Configuration settings and data classes
 """
 
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 import json
+from telegram_manager.models import ReactionPool, ReactionConfig
 
 @dataclass
 class SessionConfig:
@@ -19,16 +20,97 @@ class SessionConfig:
 class MonitoringTarget:
     """Configuration for monitoring a chat"""
     chat_id: str
-    reaction: str = "👍"
+    reaction_pool: Optional[ReactionPool] = None
+    reaction: Optional[str] = None  # Deprecated, kept for backward compatibility
     cooldown: float = 2.0
     last_reaction_time: float = 0
 
+    def __post_init__(self):
+        """Initialize reaction pool from single reaction if needed"""
+        # If reaction_pool is not set but reaction is, create a pool from single reaction
+        if self.reaction_pool is None and self.reaction is not None:
+            self.reaction_pool = ReactionPool(
+                reactions=[ReactionConfig(emoji=self.reaction, weight=1)]
+            )
+        # If neither is set, use default
+        elif self.reaction_pool is None and self.reaction is None:
+            self.reaction = "👍"
+            self.reaction_pool = ReactionPool(
+                reactions=[ReactionConfig(emoji="👍", weight=1)]
+            )
+    
+    def get_next_reaction(self) -> str:
+        """
+        Get next reaction from pool using weighted selection
+        
+        Returns:
+            Selected emoji string
+        """
+        if self.reaction_pool is None:
+            # Fallback to single reaction if pool is not set
+            return self.reaction if self.reaction else "👍"
+        return self.reaction_pool.select_random()
+
     def to_dict(self):
-        return {
+        """Convert to dictionary for serialization"""
+        result = {
             'chat_id': self.chat_id,
-            'reaction': self.reaction,
             'cooldown': self.cooldown
         }
+        
+        # Serialize reaction pool
+        if self.reaction_pool is not None:
+            result['reaction_pool'] = {
+                'reactions': [
+                    {'emoji': r.emoji, 'weight': r.weight}
+                    for r in self.reaction_pool.reactions
+                ]
+            }
+        # Include single reaction for backward compatibility
+        elif self.reaction is not None:
+            result['reaction'] = self.reaction
+        
+        return result
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'MonitoringTarget':
+        """
+        Create MonitoringTarget from dictionary with backward compatibility
+        
+        Args:
+            data: Dictionary containing monitoring target configuration
+            
+        Returns:
+            MonitoringTarget instance
+        """
+        chat_id = data['chat_id']
+        cooldown = data.get('cooldown', 2.0)
+        
+        # Check if reaction_pool is present
+        if 'reaction_pool' in data:
+            reactions = [
+                ReactionConfig(emoji=r['emoji'], weight=r.get('weight', 1))
+                for r in data['reaction_pool']['reactions']
+            ]
+            reaction_pool = ReactionPool(reactions=reactions)
+            return cls(
+                chat_id=chat_id,
+                reaction_pool=reaction_pool,
+                cooldown=cooldown
+            )
+        # Backward compatibility: single reaction
+        elif 'reaction' in data:
+            return cls(
+                chat_id=chat_id,
+                reaction=data['reaction'],
+                cooldown=cooldown
+            )
+        # Default
+        else:
+            return cls(
+                chat_id=chat_id,
+                cooldown=cooldown
+            )
 
 @dataclass
 class AppConfig:

@@ -33,6 +33,12 @@ from .config import (
     BOT_MAX_CONCURRENT_SCRAPES,
     BOT_REQUEST_TIMEOUT
 )
+from .sending_handler import SendingHandler
+from .monitoring_handler import MonitoringHandler
+from .session_handler import SessionHandler
+from .scraping_handler import ScrapingHandler
+from .keyboard_builder import KeyboardBuilder
+from .message_formatter import MessageFormatter
 
 # Conversation states
 SELECT_OPERATION, GET_GROUP_LINK, GET_CHANNEL_LINK, GET_BULK_LINKS, CONFIRM_OPERATION = range(5)
@@ -45,6 +51,18 @@ class TelegramBotPanel:
         
         # User session data
         self.user_sessions: Dict[int, Dict] = {}
+        
+        # Initialize sending handler
+        self.sending_handler = SendingHandler(session_manager)
+        
+        # Initialize monitoring handler
+        self.monitoring_handler = MonitoringHandler(session_manager)
+        
+        # Initialize session handler
+        self.session_handler = SessionHandler(session_manager)
+        
+        # Initialize scraping handler
+        self.scraping_handler = ScrapingHandler(session_manager)
         
         self.setup_handlers()
     
@@ -85,6 +103,18 @@ class TelegramBotPanel:
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("admins", self.admins_command))
         
+        # Add sending conversation handler
+        self.application.add_handler(self.sending_handler.get_conversation_handler())
+        
+        # Add monitoring conversation handler
+        self.application.add_handler(self.monitoring_handler.get_conversation_handler())
+        
+        # Add session conversation handler
+        self.application.add_handler(self.session_handler.get_conversation_handler())
+        
+        # Add scraping conversation handler
+        self.application.add_handler(self.scraping_handler.get_conversation_handler())
+        
         # Conversation handler for operations
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler("scrape", self.scrape_command)],
@@ -101,7 +131,8 @@ class TelegramBotPanel:
         self.application.add_handler(conv_handler)
         
         # Callback query handlers
-        self.application.add_handler(CallbackQueryHandler(self.button_handler, pattern='^(main_menu|session_stats|system_status)$'))
+        self.application.add_handler(CallbackQueryHandler(self.show_send_menu, pattern='^menu:sending$'))
+        self.application.add_handler(CallbackQueryHandler(self.button_handler, pattern='^(main_menu|system_status|nav:main)$'))
         
         # Error handler
         self.application.add_error_handler(self.error_handler)
@@ -134,10 +165,14 @@ class TelegramBotPanel:
         keyboard = self.create_glass_keyboard([
             [
                 {"text": "🔍 اسکرپ اعضا", "callback_data": "scrape_menu"},
+                {"text": "📤 ارسال پیام", "callback_data": "menu:sending"}
+            ],
+            [
+                {"text": "👁️ مانیتورینگ", "callback_data": "monitor:menu"},
                 {"text": "📊 وضعیت سیستم", "callback_data": "system_status"}
             ],
             [
-                {"text": "👥 مدیریت سشن‌ها", "callback_data": "session_stats"},
+                {"text": "👥 مدیریت سشن‌ها", "callback_data": "session:menu"},
                 {"text": "🔄 منوی اصلی", "callback_data": "main_menu"}
             ]
         ])
@@ -145,7 +180,7 @@ class TelegramBotPanel:
         await update.message.reply_text(welcome_message, reply_markup=keyboard, parse_mode='Markdown')
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """System status command"""
+        """System status command - show comprehensive system statistics"""
         user_id = update.effective_user.id
         
         if not self.is_admin(user_id):
@@ -153,44 +188,26 @@ class TelegramBotPanel:
             return
         
         try:
-            stats = await self.session_manager.get_session_stats()
+            # Get comprehensive system status
+            status_data = await self._get_system_status()
             
-            status_message = """
-            📊 **وضعیت سیستم**
+            # Format using MessageFormatter
+            status_message = MessageFormatter.format_system_status(status_data)
             
-            **آمار کلی:**
-            """
+            # Create keyboard with refresh button
+            keyboard = KeyboardBuilder.refresh_back(
+                refresh_data="action:refresh_status",
+                back_data="nav:main"
+            )
             
-            total_sessions = len(stats)
-            connected_sessions = sum(1 for s in stats.values() if s.get('connected', False))
-            monitoring_sessions = sum(1 for s in stats.values() if s.get('monitoring', False))
-            
-            status_message += f"""
-            🔹 تعداد سشن‌ها: {total_sessions}
-            🔹 سشن‌های متصل: {connected_sessions}
-            🔹 سشن‌های در حال مانیتور: {monitoring_sessions}
-            
-            **آمار امروز:**
-            """
-            
-            total_messages_today = sum(s.get('daily_stats', {}).get('messages_read', 0) for s in stats.values())
-            total_groups_today = sum(s.get('daily_stats', {}).get('groups_scraped_today', 0) for s in stats.values())
-            
-            status_message += f"""
-            🔸 پیام‌های خوانده شده: {total_messages_today}
-            🔸 گروه‌های اسکرپ شده: {total_groups_today}
-            
-            _آخرین بروزرسانی: {datetime.now().strftime("%Y-%m-%d %H:%M")}_
-            """
-            
-            keyboard = self.create_glass_keyboard([
-                [{"text": "🔄 بروزرسانی", "callback_data": "system_status"}],
-                [{"text": "🏠 منوی اصلی", "callback_data": "main_menu"}]
-            ])
-            
-            await update.message.reply_text(status_message, reply_markup=keyboard, parse_mode='Markdown')
+            await update.message.reply_text(
+                status_message,
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
             
         except Exception as e:
+            self.logger.error(f"Error getting system status: {e}")
             await update.message.reply_text(f"❌ خطا در دریافت وضعیت: {str(e)}")
     
     async def admins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -561,6 +578,27 @@ class TelegramBotPanel:
         await update.message.reply_text("❌ عملیات لغو شد")
         return ConversationHandler.END
     
+    async def show_send_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show sending menu"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        
+        if not self.is_admin(user_id):
+            await query.edit_message_text("⚠️ دسترسی محدود")
+            return
+        
+        from .persian_text import SENDING_MENU_TEXT
+        
+        keyboard = KeyboardBuilder.send_menu()
+        
+        await query.edit_message_text(
+            SENDING_MENU_TEXT,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline button clicks"""
         query = update.callback_query
@@ -574,15 +612,42 @@ class TelegramBotPanel:
         
         action = query.data
         
-        if action == 'main_menu':
-            await self.start_command(update, context)
-        elif action == 'system_status':
-            await self.status_command(update, context)
+        if action == 'main_menu' or action == 'nav:main':
+            # Show main menu
+            welcome_message = """
+🌟 **به پنل مدیریت سشن‌های تلگرام خوش آمدید**
+
+**دسترسی‌های موجود:**
+🔹 مدیریت ۲۵۰ سشن فعال
+🔹 اسکرپ اعضای گروه‌ها
+🔹 ارسال پیام به کاربران
+🔹 مانیتورینگ کانال‌ها
+🔹 استخراج لینک از کانال‌ها
+
+برای شروع از دکمه‌های زیر استفاده کنید:
+"""
+            
+            keyboard = self.create_glass_keyboard([
+                [
+                    {"text": "🔍 اسکرپ اعضا", "callback_data": "scrape_menu"},
+                    {"text": "📤 ارسال پیام", "callback_data": "menu:sending"}
+                ],
+                [
+                    {"text": "👁️ مانیتورینگ", "callback_data": "monitor:menu"},
+                    {"text": "📊 وضعیت سیستم", "callback_data": "system_status"}
+                ],
+                [
+                    {"text": "👥 مدیریت سشن‌ها", "callback_data": "session:menu"},
+                    {"text": "🔄 منوی اصلی", "callback_data": "main_menu"}
+                ]
+            ])
+            
+            await query.edit_message_text(welcome_message, reply_markup=keyboard, parse_mode='Markdown')
+        elif action == 'system_status' or action == 'action:refresh_status':
+            # Show or refresh system status
+            await self._show_system_status(query)
         elif action == 'scrape_menu':
             await self.scrape_command(update, context)
-        elif action == 'session_stats':
-            # Implement session statistics
-            await query.edit_message_text("📊 این قابلیت به زودی اضافه خواهد شد")
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors"""
@@ -595,6 +660,124 @@ class TelegramBotPanel:
                 )
             except:
                 pass
+    
+    async def _get_system_status(self) -> Dict:
+        """
+        Get comprehensive system status data
+        
+        Returns:
+            Dict with all system statistics
+            
+        Requirements: AC-5.1, AC-5.2, AC-5.3, AC-5.4, AC-5.5
+        """
+        try:
+            # Get session stats
+            stats = await self.session_manager.get_session_stats()
+            
+            # Calculate session statistics
+            total_sessions = len(stats)
+            connected_sessions = sum(1 for s in stats.values() if s.get('connected', False))
+            monitoring_sessions = sum(1 for s in stats.values() if s.get('monitoring', False))
+            
+            # Calculate active operations
+            active_scrapes = sum(
+                1 for s in stats.values() 
+                if s.get('current_operation') == 'scraping'
+            )
+            active_sends = sum(
+                1 for s in stats.values() 
+                if s.get('current_operation') == 'sending'
+            )
+            active_monitoring = monitoring_sessions
+            
+            # Calculate today's statistics
+            messages_read = sum(
+                s.get('daily_stats', {}).get('messages_read', 0) 
+                for s in stats.values()
+            )
+            groups_scraped = sum(
+                s.get('daily_stats', {}).get('groups_scraped_today', 0) 
+                for s in stats.values()
+            )
+            messages_sent = 0  # TODO: Add when sending tracking is implemented
+            
+            # Get monitoring statistics
+            monitoring_targets = getattr(self.session_manager, 'monitoring_targets', [])
+            active_channels = len([
+                t for t in monitoring_targets 
+                if (isinstance(t, dict) and t.get('enabled', True)) or 
+                   (hasattr(t, 'enabled') and t.enabled)
+            ])
+            
+            # Calculate reactions sent today (from monitoring stats)
+            reactions_sent = 0
+            reactions_today = 0
+            # TODO: Add reaction tracking when monitoring stats are available
+            
+            return {
+                'total_sessions': total_sessions,
+                'connected_sessions': connected_sessions,
+                'monitoring_sessions': monitoring_sessions,
+                'active_scrapes': active_scrapes,
+                'active_sends': active_sends,
+                'active_monitoring': active_monitoring,
+                'messages_read': messages_read,
+                'groups_scraped': groups_scraped,
+                'messages_sent': messages_sent,
+                'reactions_sent': reactions_sent,
+                'active_channels': active_channels,
+                'reactions_today': reactions_today
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting system status: {e}")
+            # Return empty stats on error
+            return {
+                'total_sessions': 0,
+                'connected_sessions': 0,
+                'monitoring_sessions': 0,
+                'active_scrapes': 0,
+                'active_sends': 0,
+                'active_monitoring': 0,
+                'messages_read': 0,
+                'groups_scraped': 0,
+                'messages_sent': 0,
+                'reactions_sent': 0,
+                'active_channels': 0,
+                'reactions_today': 0
+            }
+    
+    async def _show_system_status(self, query):
+        """
+        Show system status in response to callback query
+        
+        Args:
+            query: CallbackQuery object
+            
+        Requirements: AC-5.6
+        """
+        try:
+            # Get comprehensive system status
+            status_data = await self._get_system_status()
+            
+            # Format using MessageFormatter
+            status_message = MessageFormatter.format_system_status(status_data)
+            
+            # Create keyboard with refresh button
+            keyboard = KeyboardBuilder.refresh_back(
+                refresh_data="action:refresh_status",
+                back_data="nav:main"
+            )
+            
+            await query.edit_message_text(
+                status_message,
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error showing system status: {e}")
+            await query.edit_message_text(f"❌ خطا در دریافت وضعیت: {str(e)}")
     
     async def run(self):
         """Start the bot"""

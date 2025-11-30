@@ -188,7 +188,8 @@ class TestTelegramSessionManagerAPISignatures:
         
         assert 'self' in params
         assert 'max_concurrent_operations' in params
-        assert len(params) == 2
+        assert 'load_balancing_strategy' in params
+        assert len(params) == 3
     
     def test_load_sessions_signature(self):
         """Verify load_sessions signature"""

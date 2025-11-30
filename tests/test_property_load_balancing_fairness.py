@@ -66,7 +66,7 @@ async def test_property_load_balancing_fairness(scenario):
     
     # Create a test manager
     manager = TelegramSessionManager(max_concurrent_operations=20)
-    manager.load_balancing_strategy = strategy
+    manager.set_load_balancing_strategy(strategy)
     
     # Create mock sessions
     for i in range(num_sessions):
@@ -155,7 +155,7 @@ async def test_property_round_robin_cycles_through_all_sessions(num_sessions, nu
     assume(num_operations >= num_sessions * 2)  # At least 2 full cycles
     
     manager = TelegramSessionManager(max_concurrent_operations=20)
-    manager.load_balancing_strategy = 'round_robin'
+    manager.set_load_balancing_strategy('round_robin')
     
     # Create mock sessions
     for i in range(num_sessions):
@@ -204,7 +204,7 @@ async def test_property_least_loaded_selects_minimum_load(num_sessions, num_oper
     assume(num_operations >= 5)
     
     manager = TelegramSessionManager(max_concurrent_operations=20)
-    manager.load_balancing_strategy = 'least_loaded'
+    manager.set_load_balancing_strategy('least_loaded')
     
     # Create mock sessions
     for i in range(num_sessions):
@@ -261,7 +261,7 @@ async def test_load_balancing_fairness_simple_round_robin():
     Verifies that round-robin distributes operations evenly across sessions.
     """
     manager = TelegramSessionManager(max_concurrent_operations=10)
-    manager.load_balancing_strategy = 'round_robin'
+    manager.set_load_balancing_strategy('round_robin')
     
     # Create 3 sessions
     for i in range(3):
@@ -296,7 +296,7 @@ async def test_load_balancing_fairness_simple_least_loaded():
     Verifies that least-loaded selects the session with minimum load.
     """
     manager = TelegramSessionManager(max_concurrent_operations=10)
-    manager.load_balancing_strategy = 'least_loaded'
+    manager.set_load_balancing_strategy('least_loaded')
     
     # Create 3 sessions
     for i in range(3):
@@ -341,7 +341,7 @@ async def test_load_balancing_skips_disconnected_sessions():
     """
     for strategy in ['round_robin', 'least_loaded']:
         manager = TelegramSessionManager(max_concurrent_operations=10)
-        manager.load_balancing_strategy = strategy
+        manager.set_load_balancing_strategy(strategy)
         
         # Create 3 sessions, disconnect one
         for i in range(3):
@@ -379,7 +379,7 @@ async def test_load_balancing_with_concurrent_operations():
     Verifies that load balancing works correctly when operations run concurrently.
     """
     manager = TelegramSessionManager(max_concurrent_operations=20)
-    manager.load_balancing_strategy = 'round_robin'
+    manager.set_load_balancing_strategy('round_robin')
     
     # Create 4 sessions
     for i in range(4):
@@ -434,7 +434,7 @@ async def test_load_balancing_returns_none_when_no_sessions():
     
     # Test both strategies with no sessions
     for strategy in ['round_robin', 'least_loaded']:
-        manager.load_balancing_strategy = strategy
+        manager.set_load_balancing_strategy(strategy)
         
         result = manager._get_available_session()
         assert result is None, \
@@ -465,7 +465,7 @@ async def test_load_balancing_returns_none_when_all_disconnected():
     
     # Test both strategies
     for strategy in ['round_robin', 'least_loaded']:
-        manager.load_balancing_strategy = strategy
+        manager.set_load_balancing_strategy(strategy)
         
         result = manager._get_available_session()
         assert result is None, \

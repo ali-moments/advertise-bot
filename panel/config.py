@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Bot settings
-BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+BOT_TOKEN = os.getenv('BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 
 # Admin users (Telegram user IDs)
 ADMIN_USERS_STR = os.getenv('ADMIN_USERS', '')

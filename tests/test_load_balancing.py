@@ -22,6 +22,11 @@ async def manager_with_sessions():
         mock_session.is_connected = True
         mock_session.session_file = f"test_{i}.session"
         
+        # Add mock client for health monitoring
+        mock_session.client = MagicMock()
+        mock_session.client.is_connected = MagicMock(return_value=True)
+        mock_session.client.get_me = AsyncMock()
+        
         manager.sessions[session_name] = mock_session
         manager.session_locks[session_name] = asyncio.Lock()
         
@@ -29,7 +34,13 @@ async def manager_with_sessions():
         async with manager.metrics_lock:
             manager.session_load[session_name] = 0
     
+    # Start health monitoring so sessions are available
+    await manager.start_health_monitoring()
+    
     yield manager
+    
+    # Cleanup
+    await manager.stop_health_monitoring()
 
 
 @pytest.mark.asyncio
@@ -83,11 +94,12 @@ async def test_increment_and_decrement_session_load(manager_with_sessions):
 async def test_round_robin_session_selection(manager_with_sessions):
     """Test round-robin session selection"""
     manager = manager_with_sessions
+    manager.set_load_balancing_strategy("round_robin")
     
     # Get sessions in round-robin order
     selected_sessions = []
     for _ in range(6):  # Get 6 sessions (2 full rounds)
-        session_name = manager._get_session_round_robin()
+        session_name = manager._get_available_session()
         assert session_name is not None
         selected_sessions.append(session_name)
     
@@ -101,6 +113,7 @@ async def test_round_robin_session_selection(manager_with_sessions):
 async def test_round_robin_skips_disconnected_sessions(manager_with_sessions):
     """Test that round-robin skips disconnected sessions"""
     manager = manager_with_sessions
+    manager.set_load_balancing_strategy("round_robin")
     
     # Disconnect session_1
     manager.sessions["session_1"].is_connected = False
@@ -108,7 +121,7 @@ async def test_round_robin_skips_disconnected_sessions(manager_with_sessions):
     # Get sessions in round-robin order
     selected_sessions = []
     for _ in range(4):
-        session_name = manager._get_session_round_robin()
+        session_name = manager._get_available_session()
         assert session_name is not None
         selected_sessions.append(session_name)
     
@@ -121,6 +134,7 @@ async def test_round_robin_skips_disconnected_sessions(manager_with_sessions):
 async def test_least_loaded_session_selection(manager_with_sessions):
     """Test least-loaded session selection"""
     manager = manager_with_sessions
+    manager.set_load_balancing_strategy("least_loaded")
     
     # Set different loads for sessions
     await manager.increment_session_load("session_0")
@@ -129,7 +143,7 @@ async def test_least_loaded_session_selection(manager_with_sessions):
     # session_2 has load = 0
     
     # Should select session_2 (lowest load)
-    session_name = manager._get_session_least_loaded()
+    session_name = manager._get_available_session()
     assert session_name == "session_2"
     
     # Increase session_2 load
@@ -137,7 +151,7 @@ async def test_least_loaded_session_selection(manager_with_sessions):
     await manager.increment_session_load("session_2")  # load = 2
     
     # Now session_1 has lowest load (1)
-    session_name = manager._get_session_least_loaded()
+    session_name = manager._get_available_session()
     assert session_name == "session_1"
 
 
@@ -145,12 +159,13 @@ async def test_least_loaded_session_selection(manager_with_sessions):
 async def test_least_loaded_breaks_ties_with_round_robin(manager_with_sessions):
     """Test that least-loaded uses round-robin to break ties"""
     manager = manager_with_sessions
+    manager.set_load_balancing_strategy("least_loaded")
     
     # All sessions have load = 0 (tie)
     # Should use round-robin to break tie
     selected_sessions = []
     for _ in range(6):
-        session_name = manager._get_session_least_loaded()
+        session_name = manager._get_available_session()
         assert session_name is not None
         selected_sessions.append(session_name)
     
@@ -164,6 +179,7 @@ async def test_least_loaded_breaks_ties_with_round_robin(manager_with_sessions):
 async def test_least_loaded_skips_disconnected_sessions(manager_with_sessions):
     """Test that least-loaded skips disconnected sessions"""
     manager = manager_with_sessions
+    manager.set_load_balancing_strategy("least_loaded")
     
     # Disconnect session_1
     manager.sessions["session_1"].is_connected = False
@@ -173,7 +189,7 @@ async def test_least_loaded_skips_disconnected_sessions(manager_with_sessions):
     # session_2 has load = 0
     
     # Should select session_2 (lowest load among connected)
-    session_name = manager._get_session_least_loaded()
+    session_name = manager._get_available_session()
     assert session_name == "session_2"
     
     # Even if session_1 has lower load, it should be skipped
@@ -181,7 +197,7 @@ async def test_least_loaded_skips_disconnected_sessions(manager_with_sessions):
     await manager.increment_session_load("session_2")  # load = 2
     
     # Should still select session_0 (only connected option with lower load)
-    session_name = manager._get_session_least_loaded()
+    session_name = manager._get_available_session()
     assert session_name == "session_0"
 
 
@@ -189,7 +205,7 @@ async def test_least_loaded_skips_disconnected_sessions(manager_with_sessions):
 async def test_get_available_session_round_robin_strategy(manager_with_sessions):
     """Test _get_available_session with round_robin strategy"""
     manager = manager_with_sessions
-    manager.load_balancing_strategy = "round_robin"
+    manager.set_load_balancing_strategy("round_robin")
     
     # Should use round-robin
     selected_sessions = []
@@ -206,7 +222,7 @@ async def test_get_available_session_round_robin_strategy(manager_with_sessions)
 async def test_get_available_session_least_loaded_strategy(manager_with_sessions):
     """Test _get_available_session with least_loaded strategy"""
     manager = manager_with_sessions
-    manager.load_balancing_strategy = "least_loaded"
+    manager.set_load_balancing_strategy("least_loaded")
     
     # Set different loads
     await manager.increment_session_load("session_0")
@@ -229,8 +245,10 @@ async def test_no_available_sessions_returns_none(manager_with_sessions):
         session.is_connected = False
     
     # Both strategies should return None
-    assert manager._get_session_round_robin() is None
-    assert manager._get_session_least_loaded() is None
+    manager.set_load_balancing_strategy("round_robin")
+    assert manager._get_available_session() is None
+    
+    manager.set_load_balancing_strategy("least_loaded")
     assert manager._get_available_session() is None
 
 
@@ -240,8 +258,29 @@ async def test_load_balancing_strategy_defaults_to_round_robin(manager_with_sess
     manager = manager_with_sessions
     
     # Default should be round_robin
-    assert manager.load_balancing_strategy == "round_robin"
+    assert manager.get_load_balancing_strategy() == "round_robin"
     
     # _get_available_session should use round_robin by default
     session_name = manager._get_available_session()
     assert session_name is not None
+
+
+@pytest.mark.asyncio
+async def test_set_load_balancing_strategy():
+    """Test changing load balancing strategy at runtime"""
+    manager = TelegramSessionManager(max_concurrent_operations=3)
+    
+    # Default should be round_robin
+    assert manager.get_load_balancing_strategy() == "round_robin"
+    
+    # Change to least_loaded
+    manager.set_load_balancing_strategy("least_loaded")
+    assert manager.get_load_balancing_strategy() == "least_loaded"
+    
+    # Change back to round_robin
+    manager.set_load_balancing_strategy("round_robin")
+    assert manager.get_load_balancing_strategy() == "round_robin"
+    
+    # Invalid strategy should be ignored
+    manager.set_load_balancing_strategy("invalid_strategy")
+    assert manager.get_load_balancing_strategy() == "round_robin"  # Should remain unchanged

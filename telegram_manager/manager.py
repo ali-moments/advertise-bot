@@ -8,7 +8,8 @@ import random
 from typing import List, Dict, Optional, Callable
 from .session import TelegramSession
 from .config import SessionConfig
-from .database import DatabaseManager 
+from .database import DatabaseManager
+from .load_balancer import LoadBalancer
 from .constants import (
     APP_ID, 
     APP_HASH, 
@@ -52,12 +53,13 @@ class TelegramSessionManager:
     =====================================================
     """
     
-    def __init__(self, max_concurrent_operations: int = 3):
+    def __init__(self, max_concurrent_operations: int = 3, load_balancing_strategy: str = "round_robin"):
         """
         Initialize session manager
         
         Args:
             max_concurrent_operations: Maximum concurrent operations across all sessions
+            load_balancing_strategy: Load balancing strategy ('round_robin' or 'least_loaded')
         """
         self.sessions: Dict[str, TelegramSession] = {}
         self.session_locks: Dict[str, asyncio.Lock] = {}
@@ -87,18 +89,30 @@ class TelegramSessionManager:
         }
         self.metrics_lock = asyncio.Lock()  # Protect metrics updates
         
-        # Session load balancing (Task 7.1)
+        # Session load balancing (Task 7.1, Task 10)
         self.session_load: Dict[str, int] = {}  # Active operations per session
-        self.session_selection_index: int = 0  # Round-robin index
-        self.load_balancing_strategy: str = "round_robin"  # or "least_loaded"
+        self.load_balancer = LoadBalancer(strategy=load_balancing_strategy)
         
-        # Operation retry configuration (Task 8.1)
+        # Operation retry configuration (Task 8.1, Task 12)
         self.retry_config: Dict[str, int] = {
-            'scraping': 2,  # Retry scraping operations twice
+            'scraping': 2,  # Retry scraping operations twice (total 3 attempts)
             'monitoring': 0,  # Don't retry monitoring
-            'sending': 1  # Retry sending once
+            'sending': 3  # Retry sending up to 3 times (total 4 attempts) - Requirement 5.1
         }
-        self.retry_backoff_base: float = 2.0  # Exponential backoff base (seconds)
+        self.retry_backoff_base: float = 2.0  # Exponential backoff base (seconds) - Requirement 5.3
+        
+        # Session health monitoring (Task 7, Task 14)
+        from .health_monitor import SessionHealthMonitor
+        self.health_monitor = SessionHealthMonitor()
+        
+        # Operation queue for when all sessions are unavailable (Task 14, Requirement 23.4)
+        from .models import OperationQueue
+        self.operation_queue = OperationQueue()
+        self.queue_lock = asyncio.Lock()  # Protect queue operations
+        
+        # Pending operations per session (for redistribution on failure) (Requirement 23.1, 23.5)
+        self.pending_operations: Dict[str, List] = {}  # session_name -> list of operations
+        self.pending_ops_lock = asyncio.Lock()  # Protect pending operations
 
     async def load_sessions_from_db(self) -> Dict[str, bool]:
         """
@@ -168,6 +182,14 @@ class TelegramSessionManager:
             except Exception as e:
                 results[config.name] = False
                 self.logger.error(f"❌ Error loading session {config.name}: {e}")
+        
+        # Start health monitoring if any sessions were loaded successfully (Task 18, Requirement 16.1, 16.2)
+        if any(results.values()):
+            try:
+                await self.start_health_monitoring()
+                self.logger.info(f"✅ Started health monitoring for {sum(results.values())} sessions")
+            except Exception as e:
+                self.logger.error(f"❌ Failed to start health monitoring: {e}")
         
         return results
 
@@ -292,9 +314,1009 @@ class TelegramSessionManager:
         self.global_monitoring_config = None
         self.logger.info("✅ Global monitoring stopped and cleaned up")
 
+    async def send_text_messages_bulk(
+        self,
+        recipients: List[str],
+        message: str,
+        delay: float = 2.0,
+        skip_invalid: bool = True,
+        priority: str = "normal"
+    ) -> Dict[str, 'MessageResult']:
+        """
+        Send text messages to multiple recipients with load balancing
+        
+        Each recipient is assigned to exactly ONE session to prevent duplicate messages.
+        
+        Args:
+            recipients: List of recipient identifiers (usernames or user IDs)
+            message: Text message to send
+            delay: Delay between sends within each session (seconds)
+            skip_invalid: Whether to skip invalid recipients or fail early
+            priority: Operation priority ('high', 'normal', or 'low') (default 'normal')
+            
+        Returns:
+            Dict mapping recipient identifiers to MessageResult objects
+            
+        Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 3.1, 4.1, 4.2, 4.3, 11.1, 11.2, 21.1, 21.2
+        """
+        from .models import MessageResult, RecipientValidator
+        
+        results = {}
+        
+        # Validate recipients before sending (Requirement 6.1)
+        validation_result = RecipientValidator.validate_recipients(recipients)
+        
+        if not validation_result.valid:
+            if skip_invalid:
+                # Filter to valid recipients only (Requirement 6.5)
+                valid_recipients, invalid_recipients = RecipientValidator.filter_valid_recipients(recipients)
+                
+                # Log warnings for invalid recipients
+                for invalid in invalid_recipients:
+                    self.logger.warning(f"⚠️ Skipping invalid recipient: {invalid}")
+                    results[invalid] = MessageResult(
+                        recipient=invalid,
+                        success=False,
+                        session_used='',
+                        error='Invalid recipient identifier'
+                    )
+                
+                # Continue with valid recipients
+                recipients = valid_recipients
+                
+                if not recipients:
+                    self.logger.error("❌ No valid recipients after filtering")
+                    return results
+            else:
+                # Fail early with validation errors
+                self.logger.error(f"❌ Recipient validation failed: {validation_result.errors}")
+                for recipient in recipients:
+                    results[recipient] = MessageResult(
+                        recipient=recipient,
+                        success=False,
+                        session_used='',
+                        error='Validation failed'
+                    )
+                return results
+        
+        if not self.sessions:
+            self.logger.error("❌ No sessions available for sending messages")
+            for recipient in recipients:
+                results[recipient] = MessageResult(
+                    recipient=recipient,
+                    success=False,
+                    session_used='',
+                    error='No sessions available'
+                )
+            return results
+        
+        # Get list of connected sessions
+        connected_sessions = [name for name, session in self.sessions.items() if session.is_connected]
+        
+        if not connected_sessions:
+            self.logger.error("❌ No connected sessions available")
+            for recipient in recipients:
+                results[recipient] = MessageResult(
+                    recipient=recipient,
+                    success=False,
+                    session_used='',
+                    error='No connected sessions available'
+                )
+            return results
+        
+        # Distribute recipients across sessions (Requirement 1.2)
+        # Each recipient is assigned to exactly ONE session (Requirement 1.3)
+        recipient_assignments = {}
+        for i, recipient in enumerate(recipients):
+            # Use load balancer to select session for this recipient
+            session_name = self._get_available_session()
+            if session_name:
+                recipient_assignments[recipient] = session_name
+            else:
+                # No session available, assign to least loaded
+                session_name = min(
+                    connected_sessions,
+                    key=lambda s: self.session_load.get(s, 0)
+                )
+                recipient_assignments[recipient] = session_name
+        
+        # Group recipients by assigned session
+        session_recipients = {}
+        for recipient, session_name in recipient_assignments.items():
+            if session_name not in session_recipients:
+                session_recipients[session_name] = []
+            session_recipients[session_name].append(recipient)
+        
+        # Log distribution with structured logging (Requirement 13.1)
+        self.logger.info(
+            f"📊 Distributing {len(recipients)} recipients across {len(session_recipients)} sessions",
+            extra={
+                'operation_type': 'text_message_send',
+                'recipient_count': len(recipients),
+                'session_count': len(session_recipients),
+                'session_distribution': {name: len(recips) for name, recips in session_recipients.items()},
+                'priority': priority,
+                'delay': delay
+            }
+        )
+        for session_name, session_recips in session_recipients.items():
+            self.logger.debug(
+                f"  - {session_name}: {len(session_recips)} recipients",
+                extra={
+                    'session_name': session_name,
+                    'recipient_count': len(session_recips)
+                }
+            )
+        
+        # Send messages from each session concurrently
+        send_tasks = []
+        for session_name, session_recips in session_recipients.items():
+            task = asyncio.create_task(
+                self._send_text_from_session(
+                    session_name,
+                    session_recips,
+                    message,
+                    delay
+                )
+            )
+            send_tasks.append(task)
+        
+        # Wait for all sends to complete and aggregate results
+        task_results = await asyncio.gather(*send_tasks, return_exceptions=True)
+        
+        for task_result in task_results:
+            if isinstance(task_result, Exception):
+                self.logger.error(f"❌ Send task failed: {task_result}")
+            elif isinstance(task_result, dict):
+                results.update(task_result)
+        
+        # Log summary with structured logging (Requirement 1.6, 13.5)
+        succeeded = sum(1 for r in results.values() if r.success)
+        failed = len(results) - succeeded
+        self.logger.info(
+            f"✅ Bulk send complete: {succeeded} succeeded, {failed} failed out of {len(results)} total",
+            extra={
+                'operation_type': 'text_message_send',
+                'total_messages': len(results),
+                'succeeded': succeeded,
+                'failed': failed,
+                'success_rate': (succeeded / len(results) * 100) if results else 0,
+                'session_count': len(session_recipients)
+            }
+        )
+        
+        return results
+    
+    async def _send_text_from_session(
+        self,
+        session_name: str,
+        recipients: List[str],
+        message: str,
+        delay: float
+    ) -> Dict[str, 'MessageResult']:
+        """
+        Send text messages from a specific session
+        
+        Args:
+            session_name: Name of the session to use
+            recipients: List of recipients for this session
+            message: Message to send
+            delay: Delay between sends
+            
+        Returns:
+            Dict mapping recipients to MessageResult objects
+        """
+        from .models import MessageResult
+        import time
+        
+        results = {}
+        session = self.sessions[session_name]
+        
+        # Increment session load (Requirement 4.2)
+        await self.increment_session_load(session_name)
+        
+        # Increment operation metric (Requirement 11.1)
+        await self.increment_operation_metric('sending')
+        
+        try:
+            for i, recipient in enumerate(recipients):
+                try:
+                    # Send message with retry logic (Requirement 5.1)
+                    result_dict = await self._execute_with_retry(
+                        'sending',
+                        session.send_text_message,
+                        recipient,
+                        message
+                    )
+                    
+                    # Create MessageResult (Requirement 1.4, 1.5)
+                    results[recipient] = MessageResult(
+                        recipient=recipient,
+                        success=result_dict.get('success', False),
+                        session_used=session_name,
+                        error=result_dict.get('error')
+                    )
+                    
+                    # Log success with structured logging (Requirement 13.2, 13.3)
+                    if results[recipient].success:
+                        self.logger.debug(
+                            f"✅ Sent to {recipient} via {session_name}",
+                            extra={
+                                'operation_type': 'text_message_send',
+                                'recipient': recipient,
+                                'session_used': session_name,
+                                'success': True
+                            }
+                        )
+                    else:
+                        self.logger.warning(
+                            f"❌ Failed to send to {recipient} via {session_name}: {results[recipient].error}",
+                            extra={
+                                'operation_type': 'text_message_send',
+                                'recipient': recipient,
+                                'session_used': session_name,
+                                'success': False,
+                                'error': results[recipient].error
+                            }
+                        )
+                    
+                except Exception as e:
+                    # Record failure (Requirement 1.5)
+                    self.logger.error(f"❌ Error sending to {recipient}: {e}")
+                    results[recipient] = MessageResult(
+                        recipient=recipient,
+                        success=False,
+                        session_used=session_name,
+                        error=str(e)
+                    )
+                
+                # Apply delay between sends (Requirement 3.1, 3.5)
+                if i < len(recipients) - 1:
+                    self.logger.debug(
+                        f"⏳ Applying delay of {delay}s before next send",
+                        extra={
+                            'operation_type': 'text_message_send',
+                            'delay_seconds': delay,
+                            'session_name': session_name,
+                            'current_recipient': i + 1,
+                            'total_recipients': len(recipients)
+                        }
+                    )
+                    await asyncio.sleep(delay)
+        
+        finally:
+            # Always decrement counters (Requirement 4.3, 11.2)
+            await self.decrement_session_load(session_name)
+            await self.decrement_operation_metric('sending')
+        
+        return results
+    
+    async def send_media_messages_bulk(
+        self,
+        recipients: List[str],
+        media_path: str,
+        media_type: str,
+        caption: Optional[str] = None,
+        delay: float = 2.0,
+        skip_invalid: bool = True,
+        priority: str = "normal"
+    ) -> Dict[str, 'MessageResult']:
+        """
+        Send media messages to multiple recipients with load balancing
+        
+        Each recipient is assigned to exactly ONE session to prevent duplicate messages.
+        
+        Args:
+            recipients: List of recipient identifiers (usernames or user IDs)
+            media_path: Path to media file
+            media_type: Type of media ('image', 'video', 'document')
+            caption: Optional caption for the media
+            delay: Delay between sends within each session (seconds)
+            skip_invalid: Whether to skip invalid recipients or fail early
+            priority: Operation priority ('high', 'normal', or 'low') (default 'normal')
+            
+        Returns:
+            Dict mapping recipient identifiers to MessageResult objects
+            
+        Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 3.1, 4.1, 4.2, 4.3, 11.1, 11.2, 21.1, 21.2
+        """
+        from .models import MessageResult, RecipientValidator, MediaHandler
+        
+        results = {}
+        
+        # Validate media file (Requirement 2.2, 2.3)
+        format_validation = MediaHandler.validate_format(media_path, media_type)
+        if not format_validation.valid:
+            error_msg = '; '.join([e.message for e in format_validation.errors])
+            self.logger.error(f"❌ Media format validation failed: {error_msg}")
+            for recipient in recipients:
+                results[recipient] = MessageResult(
+                    recipient=recipient,
+                    success=False,
+                    session_used='',
+                    error=f'Media validation failed: {error_msg}'
+                )
+            return results
+        
+        size_validation = MediaHandler.validate_size(media_path, media_type)
+        if not size_validation.valid:
+            error_msg = '; '.join([e.message for e in size_validation.errors])
+            self.logger.error(f"❌ Media size validation failed: {error_msg}")
+            for recipient in recipients:
+                results[recipient] = MessageResult(
+                    recipient=recipient,
+                    success=False,
+                    session_used='',
+                    error=f'Media validation failed: {error_msg}'
+                )
+            return results
+        
+        # Validate recipients before sending (Requirement 6.1)
+        validation_result = RecipientValidator.validate_recipients(recipients)
+        
+        if not validation_result.valid:
+            if skip_invalid:
+                # Filter to valid recipients only (Requirement 6.5)
+                valid_recipients, invalid_recipients = RecipientValidator.filter_valid_recipients(recipients)
+                
+                # Log warnings for invalid recipients
+                for invalid in invalid_recipients:
+                    self.logger.warning(f"⚠️ Skipping invalid recipient: {invalid}")
+                    results[invalid] = MessageResult(
+                        recipient=invalid,
+                        success=False,
+                        session_used='',
+                        error='Invalid recipient identifier'
+                    )
+                
+                # Continue with valid recipients
+                recipients = valid_recipients
+                
+                if not recipients:
+                    self.logger.error("❌ No valid recipients after filtering")
+                    return results
+            else:
+                # Fail early with validation errors
+                self.logger.error(f"❌ Recipient validation failed: {validation_result.errors}")
+                for recipient in recipients:
+                    results[recipient] = MessageResult(
+                        recipient=recipient,
+                        success=False,
+                        session_used='',
+                        error='Validation failed'
+                    )
+                return results
+        
+        if not self.sessions:
+            self.logger.error("❌ No sessions available for sending media")
+            for recipient in recipients:
+                results[recipient] = MessageResult(
+                    recipient=recipient,
+                    success=False,
+                    session_used='',
+                    error='No sessions available'
+                )
+            return results
+        
+        # Get list of connected sessions
+        connected_sessions = [name for name, session in self.sessions.items() if session.is_connected]
+        
+        if not connected_sessions:
+            self.logger.error("❌ No connected sessions available")
+            for recipient in recipients:
+                results[recipient] = MessageResult(
+                    recipient=recipient,
+                    success=False,
+                    session_used='',
+                    error='No connected sessions available'
+                )
+            return results
+        
+        # Distribute recipients across sessions (Requirement 2.4)
+        # Each recipient is assigned to exactly ONE session (Requirement 2.5)
+        recipient_assignments = {}
+        for i, recipient in enumerate(recipients):
+            # Use load balancer to select session for this recipient
+            session_name = self._get_available_session()
+            if session_name:
+                recipient_assignments[recipient] = session_name
+            else:
+                # No session available, assign to least loaded
+                session_name = min(
+                    connected_sessions,
+                    key=lambda s: self.session_load.get(s, 0)
+                )
+                recipient_assignments[recipient] = session_name
+        
+        # Group recipients by assigned session
+        session_recipients = {}
+        for recipient, session_name in recipient_assignments.items():
+            if session_name not in session_recipients:
+                session_recipients[session_name] = []
+            session_recipients[session_name].append(recipient)
+        
+        # Log distribution with structured logging (Requirement 13.1)
+        self.logger.info(
+            f"📊 Distributing {len(recipients)} recipients across {len(session_recipients)} sessions for {media_type}",
+            extra={
+                'operation_type': 'media_message_send',
+                'media_type': media_type,
+                'recipient_count': len(recipients),
+                'session_count': len(session_recipients),
+                'session_distribution': {name: len(recips) for name, recips in session_recipients.items()},
+                'priority': priority,
+                'delay': delay,
+                'has_caption': caption is not None
+            }
+        )
+        for session_name, session_recips in session_recipients.items():
+            self.logger.debug(
+                f"  - {session_name}: {len(session_recips)} recipients",
+                extra={
+                    'session_name': session_name,
+                    'recipient_count': len(session_recips),
+                    'media_type': media_type
+                }
+            )
+        
+        # Send media from each session concurrently
+        send_tasks = []
+        for session_name, session_recips in session_recipients.items():
+            task = asyncio.create_task(
+                self._send_media_from_session(
+                    session_name,
+                    session_recips,
+                    media_path,
+                    media_type,
+                    caption,
+                    delay
+                )
+            )
+            send_tasks.append(task)
+        
+        # Wait for all sends to complete and aggregate results
+        task_results = await asyncio.gather(*send_tasks, return_exceptions=True)
+        
+        for task_result in task_results:
+            if isinstance(task_result, Exception):
+                self.logger.error(f"❌ Send task failed: {task_result}")
+            elif isinstance(task_result, dict):
+                results.update(task_result)
+        
+        # Log summary with structured logging (Requirement 2.6, 13.5)
+        succeeded = sum(1 for r in results.values() if r.success)
+        failed = len(results) - succeeded
+        self.logger.info(
+            f"✅ Bulk media send complete: {succeeded} succeeded, {failed} failed out of {len(results)} total",
+            extra={
+                'operation_type': 'media_message_send',
+                'media_type': media_type,
+                'total_messages': len(results),
+                'succeeded': succeeded,
+                'failed': failed,
+                'success_rate': (succeeded / len(results) * 100) if results else 0,
+                'session_count': len(session_recipients),
+                'has_caption': caption is not None
+            }
+        )
+        
+        return results
+    
+    async def _send_media_from_session(
+        self,
+        session_name: str,
+        recipients: List[str],
+        media_path: str,
+        media_type: str,
+        caption: Optional[str],
+        delay: float
+    ) -> Dict[str, 'MessageResult']:
+        """
+        Send media messages from a specific session
+        
+        Args:
+            session_name: Name of the session to use
+            recipients: List of recipients for this session
+            media_path: Path to media file
+            media_type: Type of media ('image', 'video', 'document')
+            caption: Optional caption
+            delay: Delay between sends
+            
+        Returns:
+            Dict mapping recipients to MessageResult objects
+        """
+        from .models import MessageResult
+        import time
+        
+        results = {}
+        session = self.sessions[session_name]
+        
+        # Increment session load (Requirement 4.2)
+        await self.increment_session_load(session_name)
+        
+        # Increment operation metric (Requirement 11.1)
+        await self.increment_operation_metric('sending')
+        
+        try:
+            for i, recipient in enumerate(recipients):
+                try:
+                    # Select appropriate send method based on media type
+                    if media_type == 'image':
+                        send_method = session.send_image_message
+                    elif media_type == 'video':
+                        send_method = session.send_video_message
+                    elif media_type == 'document':
+                        send_method = session.send_document_message
+                    else:
+                        raise ValueError(f"Unsupported media type: {media_type}")
+                    
+                    # Send media with retry logic (Requirement 5.1)
+                    result_dict = await self._execute_with_retry(
+                        'sending',
+                        send_method,
+                        recipient,
+                        media_path,
+                        caption
+                    )
+                    
+                    # Create MessageResult
+                    results[recipient] = MessageResult(
+                        recipient=recipient,
+                        success=result_dict.get('success', False),
+                        session_used=session_name,
+                        error=result_dict.get('error')
+                    )
+                    
+                    # Log success with structured logging (Requirement 13.2, 13.3)
+                    if results[recipient].success:
+                        self.logger.debug(
+                            f"✅ Sent {media_type} to {recipient} via {session_name}",
+                            extra={
+                                'operation_type': 'media_message_send',
+                                'media_type': media_type,
+                                'recipient': recipient,
+                                'session_used': session_name,
+                                'success': True,
+                                'has_caption': caption is not None
+                            }
+                        )
+                    else:
+                        self.logger.warning(
+                            f"❌ Failed to send {media_type} to {recipient} via {session_name}: {results[recipient].error}",
+                            extra={
+                                'operation_type': 'media_message_send',
+                                'media_type': media_type,
+                                'recipient': recipient,
+                                'session_used': session_name,
+                                'success': False,
+                                'error': results[recipient].error
+                            }
+                        )
+                    
+                except Exception as e:
+                    # Record failure
+                    self.logger.error(f"❌ Error sending {media_type} to {recipient}: {e}")
+                    results[recipient] = MessageResult(
+                        recipient=recipient,
+                        success=False,
+                        session_used=session_name,
+                        error=str(e)
+                    )
+                
+                # Apply delay between sends (Requirement 3.1, 3.5)
+                if i < len(recipients) - 1:
+                    self.logger.debug(
+                        f"⏳ Applying delay of {delay}s before next send",
+                        extra={
+                            'operation_type': 'media_message_send',
+                            'media_type': media_type,
+                            'delay_seconds': delay,
+                            'session_name': session_name,
+                            'current_recipient': i + 1,
+                            'total_recipients': len(recipients)
+                        }
+                    )
+                    await asyncio.sleep(delay)
+        
+        finally:
+            # Always decrement counters (Requirement 4.3, 11.2)
+            await self.decrement_session_load(session_name)
+            await self.decrement_operation_metric('sending')
+        
+        return results
+    
+    async def send_from_csv(
+        self,
+        csv_path: str,
+        message: str,
+        batch_size: int = 1000,
+        delay: float = 2.0,
+        resumable: bool = True,
+        operation_id: Optional[str] = None,
+        priority: str = "normal"
+    ) -> 'BulkSendResult':
+        """
+        Send messages to recipients from a CSV file with batch processing and progress tracking
+        
+        Implements:
+        - CSV parsing with automatic streaming for large files (Requirement 12.1, 20.1, 20.2)
+        - Batch processing with configurable batch size (Requirement 24.1, 24.2)
+        - Progress tracking and resumable operations (Requirement 25.1, 25.2, 25.3, 25.4, 25.5)
+        - Progress updates after each batch (Requirement 20.5, 24.3)
+        - Graceful error handling for CSV parsing errors (Requirement 12.3, 12.5, 20.4, 24.4)
+        
+        Args:
+            csv_path: Path to CSV file containing recipient identifiers
+            message: Text message to send
+            batch_size: Number of recipients to process per batch (default 1000)
+            delay: Delay between sends within each session (seconds)
+            resumable: Whether to enable checkpoint-based resumption (default True)
+            operation_id: Optional operation ID for resuming (auto-generated if not provided)
+            priority: Operation priority ('high', 'normal', or 'low') (default 'normal')
+            
+        Returns:
+            BulkSendResult with complete operation results
+            
+        Requirements: 12.1, 12.4, 12.5, 20.2, 20.5, 24.1, 24.3, 24.4, 21.1, 21.2
+        """
+        from .models import BulkSendResult, MessageResult, CSVProcessor, ProgressTracker
+        import time
+        import uuid
+        
+        start_time = time.time()
+        
+        # Generate operation ID if not provided
+        if operation_id is None:
+            operation_id = f"csv_send_{uuid.uuid4().hex[:8]}"
+        
+        # Initialize progress tracker if resumable
+        progress_tracker = None
+        completed_recipients = set()
+        
+        if resumable:
+            progress_tracker = ProgressTracker()
+            
+            # Try to load existing checkpoint (Requirement 25.4)
+            try:
+                completed_recipients = await progress_tracker.load_checkpoint(operation_id)
+                self.logger.info(
+                    f"📂 Resuming operation {operation_id}: "
+                    f"{len(completed_recipients)} recipients already completed"
+                )
+            except FileNotFoundError:
+                # No existing checkpoint, create new one (Requirement 25.1)
+                # We'll create it after we know the total count
+                pass
+        
+        # Parse CSV file (Requirement 12.1)
+        self.logger.info(f"📄 Parsing CSV file: {csv_path}")
+        
+        try:
+            csv_processor = CSVProcessor()
+            
+            # Check if we should use streaming (Requirement 20.1)
+            use_streaming = csv_processor.should_use_streaming(csv_path)
+            if use_streaming:
+                self.logger.info(f"📊 Large file detected, using streaming parser")
+            
+            # Collect all recipients and process in batches
+            all_results = {}
+            total_recipients = 0
+            processed_recipients = 0
+            batch_number = 0
+            
+            # Parse CSV in batches (Requirement 20.2, 24.1)
+            async for batch in csv_processor.parse_csv(csv_path, batch_size):
+                batch_number += 1
+                
+                # Filter out already completed recipients if resuming (Requirement 25.4)
+                if resumable and completed_recipients:
+                    original_batch_size = len(batch)
+                    batch = [r for r in batch if r not in completed_recipients]
+                    skipped = original_batch_size - len(batch)
+                    if skipped > 0:
+                        self.logger.info(
+                            f"⏭️  Skipping {skipped} already completed recipients in batch {batch_number}"
+                        )
+                
+                if not batch:
+                    # All recipients in this batch were already completed
+                    continue
+                
+                # Create checkpoint on first batch if resumable (Requirement 25.1)
+                if resumable and progress_tracker and batch_number == 1:
+                    # We need to count total recipients first
+                    # For now, we'll update the checkpoint as we go
+                    pass
+                
+                total_recipients += len(batch)
+                
+                # Log batch processing start with structured logging (Requirement 20.5, 24.3, 13.1)
+                self.logger.info(
+                    f"📦 Processing batch {batch_number}: {len(batch)} recipients "
+                    f"(total processed: {processed_recipients})",
+                    extra={
+                        'operation_type': 'csv_batch_send',
+                        'operation_id': operation_id,
+                        'batch_number': batch_number,
+                        'batch_size': len(batch),
+                        'total_processed': processed_recipients,
+                        'resumable': resumable
+                    }
+                )
+                
+                try:
+                    # Send messages to batch (Requirement 12.4)
+                    batch_results = await self.send_text_messages_bulk(
+                        recipients=batch,
+                        message=message,
+                        delay=delay,
+                        skip_invalid=True  # Skip invalid recipients (Requirement 12.5)
+                    )
+                    
+                    # Aggregate results
+                    all_results.update(batch_results)
+                    
+                    # Update progress tracking (Requirement 25.2)
+                    if resumable and progress_tracker:
+                        # Collect successfully completed recipients
+                        batch_completed = [
+                            r for r, result in batch_results.items()
+                            if result.success
+                        ]
+                        batch_failed = [
+                            r for r, result in batch_results.items()
+                            if not result.success
+                        ]
+                        
+                        # Create checkpoint if this is the first batch
+                        if batch_number == 1:
+                            # Estimate total based on first batch
+                            # We'll update this as we process more batches
+                            await progress_tracker.create_checkpoint(
+                                operation_id=operation_id,
+                                total_items=len(batch)  # Will be updated
+                            )
+                        
+                        # Update checkpoint with completed recipients
+                        await progress_tracker.update_checkpoint(
+                            operation_id=operation_id,
+                            completed=batch_completed,
+                            failed=batch_failed
+                        )
+                    
+                    processed_recipients += len(batch)
+                    
+                    # Log batch completion with progress and structured logging (Requirement 20.5, 24.3, 13.5)
+                    succeeded = sum(1 for r in batch_results.values() if r.success)
+                    failed = len(batch_results) - succeeded
+                    self.logger.info(
+                        f"✅ Batch {batch_number} complete: "
+                        f"{succeeded} succeeded, {failed} failed "
+                        f"(total processed: {processed_recipients})",
+                        extra={
+                            'operation_type': 'csv_batch_send',
+                            'operation_id': operation_id,
+                            'batch_number': batch_number,
+                            'batch_succeeded': succeeded,
+                            'batch_failed': failed,
+                            'batch_success_rate': (succeeded / len(batch_results) * 100) if batch_results else 0,
+                            'total_processed': processed_recipients
+                        }
+                    )
+                    
+                    # Get progress if available
+                    if resumable and progress_tracker:
+                        progress = progress_tracker.get_progress(operation_id)
+                        if progress:
+                            self.logger.info(
+                                f"📊 Progress: {progress.percentage_complete():.1f}% complete, "
+                                f"estimated time remaining: {progress.estimated_time_remaining():.1f}s"
+                            )
+                    
+                except Exception as e:
+                    # Batch failure - log and continue with next batch (Requirement 24.4)
+                    self.logger.error(
+                        f"❌ Batch {batch_number} failed: {e}. Continuing with next batch..."
+                    )
+                    
+                    # Mark all recipients in failed batch as failed
+                    for recipient in batch:
+                        all_results[recipient] = MessageResult(
+                            recipient=recipient,
+                            success=False,
+                            session_used='',
+                            error=f'Batch processing error: {str(e)}'
+                        )
+                    
+                    # Continue with next batch (Requirement 24.4)
+                    continue
+                
+                # Release memory between batches (Requirement 20.3, 24.2)
+                # Python's garbage collector will handle this, but we can help by clearing references
+                batch = None
+                batch_results = None
+            
+            # Calculate final statistics
+            duration = time.time() - start_time
+            succeeded = sum(1 for r in all_results.values() if r.success)
+            failed = len(all_results) - succeeded
+            
+            # Remove checkpoint on successful completion (Requirement 25.5)
+            if resumable and progress_tracker:
+                await progress_tracker.remove_checkpoint(operation_id)
+                self.logger.info(f"🗑️  Removed checkpoint for completed operation {operation_id}")
+            
+            # Log final summary with structured logging (Requirement 13.5)
+            self.logger.info(
+                f"✅ CSV send operation complete: "
+                f"{succeeded} succeeded, {failed} failed out of {len(all_results)} total "
+                f"(duration: {duration:.1f}s, batches: {batch_number})",
+                extra={
+                    'operation_type': 'csv_send_complete',
+                    'operation_id': operation_id,
+                    'total_messages': len(all_results),
+                    'succeeded': succeeded,
+                    'failed': failed,
+                    'success_rate': (succeeded / len(all_results) * 100) if all_results else 0,
+                    'duration_seconds': duration,
+                    'batch_count': batch_number,
+                    'csv_path': csv_path
+                }
+            )
+            
+            # Return bulk send result
+            return BulkSendResult(
+                total=len(all_results),
+                succeeded=succeeded,
+                failed=failed,
+                results=all_results,
+                duration=duration,
+                operation_id=operation_id
+            )
+            
+        except FileNotFoundError as e:
+            # CSV file not found (Requirement 12.2)
+            self.logger.error(f"❌ CSV file not found: {csv_path}")
+            raise ValueError(f"CSV file does not exist: {csv_path}") from e
+            
+        except ValueError as e:
+            # CSV format invalid (Requirement 12.3)
+            self.logger.error(f"❌ Invalid CSV format: {e}")
+            raise ValueError(f"Failed to parse CSV file: {str(e)}") from e
+            
+        except Exception as e:
+            # Unexpected error
+            self.logger.error(f"❌ Unexpected error during CSV send operation: {e}")
+            raise
+
+    async def preview_send(
+        self,
+        recipients: List[str],
+        message: Optional[str] = None,
+        media_path: Optional[str] = None,
+        media_type: Optional[str] = None,
+        delay: float = 2.0
+    ) -> 'SendPreview':
+        """
+        Preview a message sending operation without actually sending
+        
+        Validates all inputs and calculates session distribution and estimated duration
+        without sending any messages.
+        
+        Args:
+            recipients: List of recipient identifiers (usernames or user IDs)
+            message: Text message (for text sends)
+            media_path: Path to media file (for media sends)
+            media_type: Type of media ('image', 'video', 'document')
+            delay: Delay between sends within each session (seconds)
+            
+        Returns:
+            SendPreview with validation results, distribution plan, and time estimate
+            
+        Requirements: 15.1, 15.2, 15.3, 15.4, 15.5
+        """
+        from .models import SendPreview, RecipientValidator, MediaHandler, ValidationResult, ValidationError
+        
+        # Validate recipients (Requirement 15.2, 15.5)
+        validation_result = RecipientValidator.validate_recipients(recipients)
+        
+        # If media send, validate media file (Requirement 15.5)
+        if media_path and media_type:
+            format_validation = MediaHandler.validate_format(media_path, media_type)
+            if not format_validation.valid:
+                # Merge validation errors
+                validation_result.valid = False
+                validation_result.errors.extend(format_validation.errors)
+            
+            size_validation = MediaHandler.validate_size(media_path, media_type)
+            if not size_validation.valid:
+                # Merge validation errors
+                validation_result.valid = False
+                validation_result.errors.extend(size_validation.errors)
+        
+        # Calculate session distribution plan (Requirement 15.3)
+        session_distribution = {}
+        
+        if not self.sessions:
+            # No sessions available
+            validation_result.valid = False
+            validation_result.errors.append(
+                ValidationError(
+                    field='sessions',
+                    value=None,
+                    rule='availability',
+                    message='No sessions available'
+                )
+            )
+        else:
+            # Get list of connected sessions
+            connected_sessions = [name for name, session in self.sessions.items() if session.is_connected]
+            
+            if not connected_sessions:
+                # No connected sessions
+                validation_result.valid = False
+                validation_result.errors.append(
+                    ValidationError(
+                        field='sessions',
+                        value=None,
+                        rule='connectivity',
+                        message='No connected sessions available'
+                    )
+                )
+            else:
+                # Simulate distribution across sessions (same logic as actual send)
+                # Each recipient is assigned to exactly ONE session
+                # We need to simulate the load balancing without actually modifying session loads
+                
+                # Create a copy of session loads for simulation
+                simulated_loads = {name: self.session_load.get(name, 0) for name in connected_sessions}
+                
+                recipient_assignments = {}
+                for i, recipient in enumerate(recipients):
+                    # Simulate load balancer selection
+                    if self.load_balancer.strategy == "least_loaded":
+                        # Select session with minimum simulated load
+                        session_name = min(connected_sessions, key=lambda s: simulated_loads[s])
+                    else:
+                        # Round-robin: cycle through connected sessions
+                        session_name = connected_sessions[i % len(connected_sessions)]
+                    
+                    recipient_assignments[recipient] = session_name
+                    
+                    # Increment simulated load for this session
+                    simulated_loads[session_name] += 1
+                
+                # Count recipients per session
+                for recipient, session_name in recipient_assignments.items():
+                    if session_name not in session_distribution:
+                        session_distribution[session_name] = 0
+                    session_distribution[session_name] += 1
+        
+        # Calculate estimated duration (Requirement 15.4)
+        # Duration = (recipients_per_session - 1) * delay for each session
+        # We take the maximum duration across all sessions since they run concurrently
+        estimated_duration = 0.0
+        if session_distribution:
+            max_recipients_per_session = max(session_distribution.values())
+            # Time = (N - 1) * delay, where N is recipients per session
+            # The -1 is because there's no delay after the last message
+            estimated_duration = max(0, (max_recipients_per_session - 1) * delay)
+        
+        # Return preview (Requirement 15.1 - no messages sent)
+        return SendPreview(
+            recipients=recipients,
+            recipient_count=len(recipients),
+            session_distribution=session_distribution,
+            estimated_duration=estimated_duration,
+            validation_result=validation_result
+        )
+
     async def bulk_send_messages(self, targets: List[str], message: str, delay: float = 2.0) -> Dict:
         """
-        Send messages using all sessions (load balancing)
+        Send messages using all sessions (load balancing) - DEPRECATED
+        
+        Use send_text_messages_bulk instead for better functionality.
         
         Args:
             targets: List of target identifiers
@@ -304,56 +1326,21 @@ class TelegramSessionManager:
         Returns:
             Dict with send results for each target
         """
-        all_results = {}
+        self.logger.warning("⚠️ bulk_send_messages is deprecated, use send_text_messages_bulk instead")
         
-        if not self.sessions:
-            self.logger.warning("❌ No sessions available for sending messages")
-            return all_results
+        # Convert to new format
+        results = await self.send_text_messages_bulk(targets, message, delay)
         
-        # Distribute targets among sessions
-        sessions_list = list(self.sessions.values())
-        targets_per_session = max(1, len(targets) // len(sessions_list))
+        # Convert MessageResult objects to old dict format for backward compatibility
+        old_format_results = {}
+        for recipient, result in results.items():
+            old_format_results[recipient] = {
+                'session': result.session_used,
+                'success': result.success,
+                'error': result.error
+            }
         
-        tasks = []
-        for i, session in enumerate(sessions_list):
-            start_idx = i * targets_per_session
-            end_idx = start_idx + targets_per_session if i < len(sessions_list) - 1 else len(targets)
-            session_targets = targets[start_idx:end_idx]
-            
-            if session_targets:
-                # Wrap bulk send with retry logic (Task 8.3)
-                async def send_with_retry():
-                    return await self._execute_with_retry(
-                        'sending',
-                        session.bulk_send_messages,
-                        session_targets,
-                        message,
-                        delay
-                    )
-                
-                task = asyncio.create_task(send_with_retry())
-                tasks.append((session, session_targets, task))
-        
-        # Wait for all sends to complete and collect results
-        for session, session_targets, task in tasks:
-            try:
-                results = await task
-                for target, result in zip(session_targets, results):
-                    all_results[target] = {
-                        'session': str(session.session_file),
-                        'success': not isinstance(result, Exception),
-                        'error': str(result) if isinstance(result, Exception) else None
-                    }
-            except Exception as e:
-                self.logger.error(f"❌ Bulk send error: {e}")
-                for target in session_targets:
-                    all_results[target] = {
-                        'session': str(session.session_file),
-                        'success': False,
-                        'error': str(e)
-                    }
-        
-        return all_results
+        return old_format_results
 
     async def bulk_get_members(self, chats: List[str], limit: int = 100) -> Dict[str, List]:
         """
@@ -571,6 +1558,169 @@ class TelegramSessionManager:
         async with self.metrics_lock:
             return self.operation_metrics.copy()
     
+    def _parse_priority(self, priority_str: str) -> 'OperationPriority':
+        """
+        Parse priority string to OperationPriority enum
+        
+        Args:
+            priority_str: Priority string ('high', 'normal', or 'low')
+            
+        Returns:
+            OperationPriority enum value
+            
+        Requirements: 21.1, 21.2
+        """
+        from .models import OperationPriority
+        
+        priority_map = {
+            'high': OperationPriority.HIGH,
+            'normal': OperationPriority.NORMAL,
+            'low': OperationPriority.LOW
+        }
+        
+        priority_lower = priority_str.lower()
+        if priority_lower not in priority_map:
+            self.logger.warning(
+                f"⚠️ Invalid priority '{priority_str}', defaulting to 'normal'"
+            )
+            return OperationPriority.NORMAL
+        
+        return priority_map[priority_lower]
+    
+    async def _queue_operation_if_busy(
+        self,
+        operation_func: Callable,
+        priority_str: str,
+        *args,
+        **kwargs
+    ) -> bool:
+        """
+        Queue operation if all sessions are busy
+        
+        Args:
+            operation_func: Function to execute
+            priority_str: Priority string ('high', 'normal', or 'low')
+            *args: Positional arguments for operation_func
+            **kwargs: Keyword arguments for operation_func
+            
+        Returns:
+            True if operation was queued, False if it can be executed immediately
+            
+        Requirements: 21.1, 21.3, 21.5
+        """
+        from .models import QueuedOperation, OperationPriority
+        import uuid
+        
+        # Check if any sessions are available
+        available_sessions = self.health_monitor.get_available_sessions()
+        connected_available = [
+            name for name in available_sessions
+            if name in self.sessions and self.sessions[name].is_connected
+        ]
+        
+        # If sessions are available, don't queue
+        if connected_available:
+            return False
+        
+        # All sessions busy, queue the operation (Requirement 21.1)
+        priority = self._parse_priority(priority_str)
+        operation_id = f"op_{uuid.uuid4().hex[:8]}"
+        
+        queued_op = QueuedOperation(
+            operation_id=operation_id,
+            priority=priority,
+            operation_func=operation_func,
+            args=args,
+            kwargs=kwargs
+        )
+        
+        async with self.queue_lock:
+            self.operation_queue.enqueue(queued_op)
+            queue_size = self.operation_queue.size()
+        
+        self.logger.info(
+            f"📥 Queued operation {operation_id} with priority {priority_str} "
+            f"(queue size: {queue_size})"
+        )
+        
+        return True
+    
+    async def _process_priority_queue(self):
+        """
+        Process operations from priority queue when sessions become available
+        
+        High-priority operations are processed before normal-priority,
+        and normal before low-priority. Within same priority, FIFO order is maintained.
+        
+        Requirements: 21.3, 21.4, 21.5
+        """
+        async with self.queue_lock:
+            if self.operation_queue.is_empty():
+                return
+            
+            # Get available sessions
+            available_sessions = self.health_monitor.get_available_sessions()
+            connected_available = [
+                name for name in available_sessions
+                if name in self.sessions and self.sessions[name].is_connected
+            ]
+            
+            if not connected_available:
+                # No sessions available yet
+                return
+            
+            processed_count = 0
+            
+            # Process operations in priority order (Requirement 21.3, 21.5)
+            while not self.operation_queue.is_empty():
+                # Check if sessions are still available
+                available_sessions = self.health_monitor.get_available_sessions()
+                connected_available = [
+                    name for name in available_sessions
+                    if name in self.sessions and self.sessions[name].is_connected
+                ]
+                
+                if not connected_available:
+                    break
+                
+                # Dequeue highest priority operation (Requirement 21.3)
+                op = self.operation_queue.dequeue()
+                if not op:
+                    break
+                
+                # Execute the operation
+                self.logger.info(
+                    f"🔄 Processing queued operation {op.operation_id} "
+                    f"with priority {op.priority.name}"
+                )
+                
+                try:
+                    # Execute operation asynchronously
+                    asyncio.create_task(
+                        op.operation_func(*op.args, **op.kwargs)
+                    )
+                    processed_count += 1
+                except Exception as e:
+                    self.logger.error(
+                        f"❌ Failed to execute queued operation {op.operation_id}: {e}"
+                    )
+            
+            if processed_count > 0:
+                self.logger.info(
+                    f"✅ Processed {processed_count} queued operations "
+                    f"(remaining: {self.operation_queue.size()})"
+                )
+    
+    async def get_operation_metrics(self) -> Dict[str, int]:
+        """
+        Get current operation metrics (Task 6.3)
+        
+        Returns:
+            Dict mapping operation types to active counts
+        """
+        async with self.metrics_lock:
+            return self.operation_metrics.copy()
+    
     async def get_operation_count(self, operation_type: str) -> int:
         """
         Get the count of active operations for a specific type (Task 6.3)
@@ -622,98 +1772,69 @@ class TelegramSessionManager:
         async with self.metrics_lock:
             return self.session_load.get(session_name, 0)
     
-    def _get_session_round_robin(self) -> Optional[str]:
+    def set_load_balancing_strategy(self, strategy: str):
         """
-        Get next available session using round-robin strategy (Task 7.2)
+        Change the load balancing strategy at runtime (Task 10)
         
-        Returns:
-            Session name or None if no sessions available
+        Args:
+            strategy: New strategy ('round_robin' or 'least_loaded')
         """
-        if not self.sessions:
-            return None
-        
-        session_names = list(self.sessions.keys())
-        attempts = 0
-        
-        # Try to find a connected session
-        while attempts < len(session_names):
-            # Get next session in round-robin order
-            session_name = session_names[self.session_selection_index % len(session_names)]
-            self.session_selection_index += 1
-            
-            # Check if session is connected
-            session = self.sessions[session_name]
-            if session.is_connected:
-                self.logger.debug(f"🔄 Round-robin selected: {session_name}")
-                return session_name
-            
-            attempts += 1
-        
-        # No connected sessions found
-        self.logger.warning("⚠️ No connected sessions available for round-robin selection")
-        return None
+        self.load_balancer.set_strategy(strategy)
     
-    def _get_session_least_loaded(self) -> Optional[str]:
+    def get_load_balancing_strategy(self) -> str:
         """
-        Get session with minimum active operations (Task 7.3)
-        Break ties with round-robin
+        Get the current load balancing strategy (Task 10)
         
         Returns:
-            Session name or None if no sessions available
+            Current strategy name
         """
-        if not self.sessions:
-            return None
-        
-        # Find connected sessions with their loads
-        connected_sessions = []
-        for session_name, session in self.sessions.items():
-            if session.is_connected:
-                load = self.session_load.get(session_name, 0)
-                connected_sessions.append((session_name, load))
-        
-        if not connected_sessions:
-            self.logger.warning("⚠️ No connected sessions available for least-loaded selection")
-            return None
-        
-        # Find minimum load
-        min_load = min(load for _, load in connected_sessions)
-        
-        # Get all sessions with minimum load
-        least_loaded = [name for name, load in connected_sessions if load == min_load]
-        
-        # If multiple sessions have same load, use round-robin to break tie
-        if len(least_loaded) > 1:
-            selected = least_loaded[self.session_selection_index % len(least_loaded)]
-            self.session_selection_index += 1
-            self.logger.debug(f"⚖️ Least-loaded selected (tie-break): {selected} (load: {min_load})")
-        else:
-            selected = least_loaded[0]
-            self.logger.debug(f"⚖️ Least-loaded selected: {selected} (load: {min_load})")
-        
-        return selected
+        return self.load_balancer.get_strategy()
     
     def _get_available_session(self) -> Optional[str]:
         """
-        Get an available session using configured strategy (Task 7.4)
+        Get an available session using configured strategy (Task 7.4, Task 10, Task 14)
+        
+        Excludes failed sessions from selection (Requirement 23.2)
         
         Returns:
             Session name or None if no sessions available
         """
-        if self.load_balancing_strategy == "least_loaded":
-            return self._get_session_least_loaded()
+        # Get available (non-failed) sessions
+        # If health monitor has sessions registered, use its filtering
+        # Otherwise, use all sessions (for backward compatibility with tests)
+        if self.health_monitor.sessions:
+            available_session_names = self.health_monitor.get_available_sessions()
         else:
-            # Default to round-robin
-            return self._get_session_round_robin()
+            # Health monitor not initialized, use all sessions
+            available_session_names = list(self.sessions.keys())
+        
+        # Filter to only include sessions that exist and are connected
+        available_sessions = {
+            name: session for name, session in self.sessions.items()
+            if name in available_session_names and session.is_connected
+        }
+        
+        if not available_sessions:
+            return None
+        
+        # Use load balancer to select from available sessions
+        return self.load_balancer.select_session(available_sessions, self.session_load)
     
     def _is_transient_error(self, error: Exception) -> bool:
         """
         Determine if an error is transient and should be retried
         
+        Classifies errors into two categories:
+        - Transient: Network issues, timeouts, rate limiting - should retry (Requirement 5.1)
+        - Permanent: Auth failures, not found, permissions - should not retry (Requirement 5.2)
+        
         Args:
             error: The exception to check
             
         Returns:
-            True if error is transient, False if permanent
+            True if error is transient (should retry), False if permanent (should not retry)
+            
+        Requirements: 5.1, 5.2
         """
         error_str = str(error).lower()
         error_type = type(error).__name__
@@ -779,6 +1900,13 @@ class TelegramSessionManager:
         """
         Execute an operation with retry logic and exponential backoff
         
+        Implements comprehensive retry logic with:
+        - Transient vs permanent error classification (Requirement 5.2)
+        - Exponential backoff between retries (Requirement 5.3)
+        - Configurable retry counts per operation type (Requirement 5.1)
+        - Detailed logging of retry attempts (Requirement 5.5)
+        - Proper error propagation when retries exhausted (Requirement 5.4)
+        
         Args:
             operation_type: Type of operation ('scraping', 'monitoring', 'sending')
             operation_func: The operation function to execute
@@ -789,7 +1917,9 @@ class TelegramSessionManager:
             Result from the operation
             
         Raises:
-            Exception: The final exception if all retries fail
+            Exception: The final exception if all retries fail or if error is permanent
+            
+        Requirements: 5.1, 5.2, 5.3, 5.4, 5.5
         """
         import time
         max_retries = self.retry_config.get(operation_type, 0)
@@ -800,17 +1930,17 @@ class TelegramSessionManager:
         while attempt <= max_retries:
             try:
                 if attempt > 0:
-                    # Enhanced retry logging (Requirement 7.3)
+                    # Enhanced retry logging with attempt count (Requirement 5.5)
                     self.logger.info(
                         f"🔄 Retry attempt {attempt}/{max_retries} for {operation_type} "
                         f"(total elapsed: {time.time() - start_time:.1f}s)"
                     )
                 
-                # Execute the operation
+                # Execute the operation (Requirement 5.1)
                 result = await operation_func(*args, **kwargs)
                 
                 if attempt > 0:
-                    # Log successful retry with context (Requirement 7.3)
+                    # Log successful retry with attempt count (Requirement 5.5)
                     self.logger.info(
                         f"✅ {operation_type} succeeded on retry {attempt} "
                         f"(total elapsed: {time.time() - start_time:.1f}s)"
@@ -821,30 +1951,35 @@ class TelegramSessionManager:
             except Exception as e:
                 last_error = e
                 
-                # Check if we should retry
+                # Check if we should retry (Requirement 5.4)
                 if attempt >= max_retries:
-                    # Enhanced error logging with full context (Requirement 7.3)
+                    # Maximum retries exhausted - mark as failed (Requirement 5.4)
+                    # Enhanced error logging with full context (Requirement 5.5)
                     self.logger.error(
                         f"❌ {operation_type} failed after {max_retries} retries: {e} "
                         f"(total elapsed: {time.time() - start_time:.1f}s, "
                         f"error_type: {type(e).__name__})"
                     )
+                    # Note: Metrics are decremented by caller in finally block
                     raise
                 
-                # Check if error is transient
+                # Check if error is transient (Requirement 5.2)
                 is_transient = self._is_transient_error(e)
                 if not is_transient:
-                    # Log permanent error with context (Requirement 7.3)
+                    # Permanent error - don't retry (Requirement 5.2)
+                    # Log permanent error with context (Requirement 5.5)
                     self.logger.warning(
                         f"⚠️ Permanent error detected for {operation_type}, not retrying: {e} "
                         f"(error_type: {type(e).__name__})"
                     )
+                    # Note: Metrics are decremented by caller in finally block
                     raise
                 
-                # Calculate backoff delay
+                # Calculate exponential backoff delay (Requirement 5.3)
+                # Formula: backoff_delay = base^attempt (e.g., 2^0=1s, 2^1=2s, 2^2=4s, 2^3=8s)
                 backoff_delay = self.retry_backoff_base ** attempt
                 
-                # Enhanced retry attempt logging (Requirement 7.3)
+                # Enhanced retry attempt logging (Requirement 5.5)
                 self.logger.warning(
                     f"⚠️ {operation_type} failed (attempt {attempt + 1}/{max_retries + 1}): {e} "
                     f"(error_type: {type(e).__name__}, is_transient: {is_transient})"
@@ -941,16 +2076,222 @@ class TelegramSessionManager:
             TelegramSession or None if not found
         """
         return self.sessions.get(name)
+    
+    async def _handle_session_failure(self, session_name: str):
+        """
+        Handle session failure by redistributing pending operations
+        
+        This is called when a session fails and cannot be reconnected.
+        All pending operations for the failed session are redistributed
+        to other available sessions.
+        
+        Args:
+            session_name: Name of the failed session
+            
+        Requirements: 23.1, 23.2, 23.5
+        """
+        self.logger.warning(f"🔄 Handling failure for session {session_name}")
+        
+        # Get pending operations for this session
+        async with self.pending_ops_lock:
+            pending_ops = self.pending_operations.get(session_name, [])
+            
+            if not pending_ops:
+                self.logger.info(f"No pending operations to redistribute for {session_name}")
+                return
+            
+            self.logger.info(
+                f"📦 Redistributing {len(pending_ops)} pending operations from failed session {session_name}"
+            )
+            
+            # Get available sessions (excluding failed ones)
+            available_sessions = self.health_monitor.get_available_sessions()
+            connected_available = [
+                name for name in available_sessions
+                if name in self.sessions and self.sessions[name].is_connected
+            ]
+            
+            if not connected_available:
+                # No available sessions - queue operations (Requirement 23.4)
+                self.logger.warning(
+                    f"⚠️ No available sessions to redistribute operations. "
+                    f"Queuing {len(pending_ops)} operations..."
+                )
+                
+                async with self.queue_lock:
+                    for op in pending_ops:
+                        self.operation_queue.enqueue(op)
+                
+                # Clear pending operations for failed session
+                self.pending_operations[session_name] = []
+                
+                self.logger.info(
+                    f"✅ Queued {len(pending_ops)} operations "
+                    f"(total queue size: {self.operation_queue.size()})"
+                )
+            else:
+                # Redistribute to available sessions (Requirement 23.1)
+                # Preserve operation order within priority levels (Requirement 23.5)
+                redistributed_count = 0
+                
+                for op in pending_ops:
+                    # Select a session for this operation
+                    target_session = self._get_available_session()
+                    
+                    if target_session:
+                        # Add to target session's pending operations
+                        if target_session not in self.pending_operations:
+                            self.pending_operations[target_session] = []
+                        self.pending_operations[target_session].append(op)
+                        redistributed_count += 1
+                        
+                        self.logger.debug(
+                            f"Redistributed operation {op.operation_id} "
+                            f"from {session_name} to {target_session}"
+                        )
+                    else:
+                        # No session available, queue it
+                        async with self.queue_lock:
+                            self.operation_queue.enqueue(op)
+                
+                # Clear pending operations for failed session
+                self.pending_operations[session_name] = []
+                
+                self.logger.info(
+                    f"✅ Redistributed {redistributed_count} operations to available sessions"
+                )
+    
+    async def _handle_session_recovery(self, session_name: str):
+        """
+        Handle session recovery by reintegrating it into the load balancer
+        
+        This is called when a failed session successfully reconnects.
+        The session becomes available for new operations.
+        
+        Args:
+            session_name: Name of the recovered session
+            
+        Requirements: 23.3, 21.1
+        """
+        self.logger.info(f"✅ Handling recovery for session {session_name}")
+        
+        # Session is automatically reintegrated into load balancer
+        # because health_monitor.get_available_sessions() will now include it
+        
+        # Process queued operations if any (for session failure recovery)
+        await self._process_queued_operations()
+        
+        # Process priority queue operations (for priority queue integration)
+        await self._process_priority_queue()
+        
+        self.logger.info(f"✅ Session {session_name} reintegrated into load balancer")
+    
+    async def _process_queued_operations(self):
+        """
+        Process queued operations when sessions become available
+        
+        This is called when a session recovers or when checking if
+        queued operations can be executed.
+        
+        Requirements: 23.4
+        """
+        async with self.queue_lock:
+            if self.operation_queue.is_empty():
+                return
+            
+            queue_size = self.operation_queue.size()
+            self.logger.info(f"📦 Processing {queue_size} queued operations...")
+            
+            processed = 0
+            failed_to_process = []
+            
+            while not self.operation_queue.is_empty():
+                # Get available sessions
+                available_sessions = self.health_monitor.get_available_sessions()
+                connected_available = [
+                    name for name in available_sessions
+                    if name in self.sessions and self.sessions[name].is_connected
+                ]
+                
+                if not connected_available:
+                    # No sessions available, stop processing
+                    self.logger.warning(
+                        f"⚠️ No available sessions to process queued operations. "
+                        f"Remaining: {self.operation_queue.size()}"
+                    )
+                    break
+                
+                # Dequeue operation
+                op = self.operation_queue.dequeue()
+                if not op:
+                    break
+                
+                # Select a session for this operation
+                target_session = self._get_available_session()
+                
+                if target_session:
+                    # Add to target session's pending operations
+                    async with self.pending_ops_lock:
+                        if target_session not in self.pending_operations:
+                            self.pending_operations[target_session] = []
+                        self.pending_operations[target_session].append(op)
+                    
+                    processed += 1
+                    self.logger.debug(f"Assigned queued operation {op.operation_id} to {target_session}")
+                else:
+                    # Could not assign, re-queue
+                    failed_to_process.append(op)
+            
+            # Re-queue operations that couldn't be processed
+            for op in failed_to_process:
+                self.operation_queue.enqueue(op)
+            
+            if processed > 0:
+                self.logger.info(f"✅ Processed {processed} queued operations")
+    
+    async def start_health_monitoring(self):
+        """
+        Start session health monitoring with failure/recovery callbacks
+        
+        Requirements: 16.1, 16.2, 23.1, 23.3
+        """
+        if not self.sessions:
+            self.logger.warning("⚠️ No sessions to monitor")
+            return
+        
+        # Start health monitoring with callbacks
+        await self.health_monitor.start_monitoring(
+            sessions=self.sessions,
+            failure_callback=self._handle_session_failure,
+            recovery_callback=self._handle_session_recovery
+        )
+        
+        self.logger.info("✅ Started session health monitoring with failure recovery")
+    
+    async def stop_health_monitoring(self):
+        """
+        Stop session health monitoring
+        
+        Requirements: 16.2
+        """
+        await self.health_monitor.stop_monitoring()
+        self.logger.info("✅ Stopped session health monitoring")
 
     async def shutdown(self):
         """
-        Graceful shutdown of all sessions with timeout and cleanup (Task 10.5)
+        Graceful shutdown of all sessions with timeout and cleanup (Task 10.5, Task 14)
         
-        Requirements: 5.4, 6.2
+        Requirements: 5.4, 6.2, 16.2
         """
         self.logger.info("🔴 Shutting down session manager...")
         
-        # Stop monitoring first
+        # Stop health monitoring first
+        try:
+            await self.stop_health_monitoring()
+        except Exception as e:
+            self.logger.error(f"❌ Error stopping health monitoring during shutdown: {e}")
+        
+        # Stop monitoring
         try:
             await self.stop_global_monitoring()
         except Exception as e:

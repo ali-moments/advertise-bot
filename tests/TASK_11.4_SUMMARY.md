@@ -1,134 +1,82 @@
-# Task 11.4: Property Test for Lock Release on Error - Summary
+# Task 11.4: Property Test for Summary Accuracy - Summary
 
 ## Task Description
-Write property test for lock release on error
-- **Property 6: Lock release on error**
-- **Validates: Requirements 7.1, 7.2, 7.3, 7.4**
+Write property test for summary accuracy to validate that for any bulk send operation, the sum of success count and failure count equals the total recipient count.
 
-## Implementation Summary
+**Property 5: Summary accuracy**
+**Validates: Requirements 1.5**
 
-### Test File Created
-- `tests/test_property_lock_release_on_error.py`
+## Implementation
 
-### Property Test Implementation
+Created `tests/test_property_summary_accuracy.py` with comprehensive property-based tests using Hypothesis.
 
-The property-based test verifies that **for any operation that encounters an error, all locks held by that operation should be released before the error is propagated to the caller**.
+### Test Coverage
 
-#### Test Strategy
+1. **Main Property Test** (`test_property_summary_accuracy`)
+   - Tests with varying numbers of sessions (1-10)
+   - Tests with varying numbers of recipients (1-100)
+   - Tests with varying success rates (0.0-1.0)
+   - Verifies: `success_count + failure_count == total_recipients`
+   - Runs 100 examples
 
-1. **Property Test (`test_property_lock_release_on_error`)**:
-   - Uses Hypothesis to generate various error scenarios
-   - Tests different error types: operation errors, timeouts, lock timeouts, network errors, validation errors
-   - Tests different error timings: immediate vs delayed
-   - Tests different lock depths: 1-3 nested locks
-   - Verifies all locks are released after error
-   - Verifies other operations can proceed after error
+2. **All Succeed Scenario** (`test_property_summary_accuracy_all_succeed`)
+   - Tests when all sends succeed
+   - Verifies: `success_count == total_recipients` and `failure_count == 0`
+   - Runs 100 examples
 
-2. **Error Scenarios Tested**:
-   - `operation_error`: Runtime errors during operation execution
-   - `timeout_error`: Operation timeout errors
-   - `lock_timeout`: Lock acquisition timeout errors
-   - `network_error`: Connection/network errors
-   - `validation_error`: Input validation errors
+3. **All Fail Scenario** (`test_property_summary_accuracy_all_fail`)
+   - Tests when all sends fail
+   - Verifies: `failure_count == total_recipients` and `success_count == 0`
+   - Runs 100 examples
 
-3. **Lock Levels Tested**:
-   - Manager-level locks (metrics_lock)
-   - Manager-level session locks (session_locks)
-   - Session-level operation locks (operation_lock)
-   - Session-level task locks (task_lock)
-   - Session-level handler locks (_handler_lock)
+4. **Partial Success Scenario** (`test_property_summary_accuracy_partial_success`)
+   - Tests with mixed success/failure (odd indices fail, even succeed)
+   - Verifies summary accuracy with both successes and failures
+   - Runs 100 examples
 
-### Additional Unit Tests
+5. **Invalid Recipients Scenario** (`test_property_summary_accuracy_with_invalid_recipients`)
+   - Tests with mix of valid and invalid recipients
+   - Verifies summary includes skipped invalid recipients
+   - Runs 50 examples
 
-1. **`test_lock_release_on_error_simple_example`**:
-   - Simple concrete example demonstrating basic lock release on error
-   - Uses context managers to ensure proper cleanup
-
-2. **`test_lock_release_on_semaphore_error`**:
-   - Verifies semaphores are released when errors occur
-   - Tests scrape semaphore specifically
-   - Verifies active operation counts are reset
-
-3. **`test_lock_release_on_nested_error`**:
-   - Tests nested lock acquisition and release
-   - Verifies locks are released in LIFO order (reverse of acquisition)
-   - Tracks acquisition and release order
-
-4. **`test_lock_release_on_timeout_error`**:
-   - Tests lock release when operations timeout
-   - Uses asyncio.wait_for to simulate timeout
-   - Verifies locks become available after timeout
-
-5. **`test_lock_release_isolation`**:
-   - Tests that errors in one operation don't affect other operations
-   - Runs successful and failing operations concurrently
-   - Verifies isolation between operations
-
-6. **`test_lock_release_with_retry`**:
-   - Tests lock release between retry attempts
-   - Verifies locks are properly released and re-acquired
-   - Tracks lock state across multiple attempts
+6. **Concrete Examples**
+   - Simple example with 5 recipients (3 succeed, 2 fail)
+   - No sessions available (all fail)
+   - Media messages (2 succeed, 1 fails)
+   - Single recipient edge case
 
 ## Test Results
 
 All tests passed successfully:
+- 9 test functions executed
+- 100+ property-based test examples per main test
+- Total execution time: ~25 seconds
+- **Status: ✅ PASSED**
 
-```
-tests/test_property_lock_release_on_error.py::test_property_lock_release_on_error PASSED
-tests/test_property_lock_release_on_error.py::test_lock_release_on_error_simple_example PASSED
-tests/test_property_lock_release_on_error.py::test_lock_release_on_semaphore_error PASSED
-tests/test_property_lock_release_on_error.py::test_lock_release_on_nested_error PASSED
-tests/test_property_lock_release_on_error.py::test_lock_release_on_timeout_error PASSED
-tests/test_property_lock_release_on_error.py::test_lock_release_isolation PASSED
-tests/test_property_lock_release_on_error.py::test_lock_release_with_retry PASSED
-
-7 passed in 2.28s
-```
-
-## Property Coverage
+## Property Validation
 
 The property test validates:
+1. **Completeness**: Every recipient is accounted for in results
+2. **Accuracy**: Sum of successes and failures equals total recipients
+3. **No Double Counting**: No recipient is counted multiple times
+4. **No Missing Recipients**: All recipients appear in results
+5. **Consistency**: Property holds across all scenarios (all succeed, all fail, partial, invalid recipients, etc.)
 
-✅ **Requirement 7.1**: Locks are released on all error paths
-- Tested with various error types and lock depths
-- Verified using try-finally blocks and context managers
+## Key Insights
 
-✅ **Requirement 7.2**: Errors in one session don't affect other sessions
-- Tested with concurrent operations on different sessions
-- Verified isolation between operations
+1. The summary accuracy property is fundamental to reliable bulk operations
+2. The property holds regardless of:
+   - Number of sessions
+   - Number of recipients
+   - Success/failure rates
+   - Presence of invalid recipients
+   - Media type (text or images)
+3. The implementation correctly handles edge cases like no sessions and single recipients
 
-✅ **Requirement 7.3**: Errors are logged with proper context
-- Verified through existing error handling implementation
-- Lock state is logged on timeouts
+## Files Modified
+- Created: `tests/test_property_summary_accuracy.py`
 
-✅ **Requirement 7.4**: Lock acquisition timeouts prevent deadlocks
-- Tested with lock timeout scenarios
-- Verified locks are released on timeout
+## Requirements Validated
+- **Requirement 1.5**: "WHEN all messages are sent THEN the system SHALL return a summary report with success and failure counts"
 
-## Key Findings
-
-1. **Proper Cleanup**: All locks are properly released using try-finally blocks and context managers
-2. **Error Isolation**: Errors in one operation don't affect locks in other operations
-3. **Semaphore Handling**: Semaphores are correctly released on errors
-4. **Nested Locks**: Nested locks are released in correct order (LIFO)
-5. **Retry Safety**: Locks are properly released between retry attempts
-6. **Timeout Handling**: Locks are released when operations timeout
-
-## Correctness Property Validated
-
-**Property 6: Lock release on error**
-
-*For any* operation that encounters an error, all locks held by that operation should be released before the error is propagated to the caller.
-
-**Status**: ✅ VALIDATED
-
-The property test ran 100 iterations with various error scenarios and confirmed that:
-- All locks are released after errors
-- Other operations can proceed after errors
-- Lock release is consistent across different error types
-- Nested locks are properly cleaned up
-- Semaphores and other synchronization primitives are released
-
-## Conclusion
-
-Task 11.4 is complete. The property test comprehensively validates that lock release on error is working correctly across all error scenarios, lock types, and operation patterns. The implementation follows best practices with try-finally blocks and context managers to ensure proper cleanup.
+The property test ensures that the summary counts are always accurate and complete, providing reliable feedback to users about bulk send operations.

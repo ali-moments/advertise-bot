@@ -20,7 +20,7 @@ async def test_retry_configuration_initialization():
     # Check retry counts per operation type
     assert manager.retry_config['scraping'] == 2
     assert manager.retry_config['monitoring'] == 0
-    assert manager.retry_config['sending'] == 1
+    assert manager.retry_config['sending'] == 3  # Updated in Task 12 for better reliability
     
     # Check backoff base
     assert manager.retry_backoff_base == 2.0
@@ -145,11 +145,11 @@ async def test_execute_with_retry_respects_operation_type_retry_count():
         await manager._execute_with_retry('scraping', mock_scrape)
     assert mock_scrape.call_count == 3  # initial + 2 retries
     
-    # Test sending (1 retry)
+    # Test sending (3 retries - updated in Task 12)
     mock_send = AsyncMock(side_effect=Exception("Connection timeout"))
     with pytest.raises(Exception):
         await manager._execute_with_retry('sending', mock_send)
-    assert mock_send.call_count == 2  # initial + 1 retry
+    assert mock_send.call_count == 4  # initial + 3 retries
     
     # Test monitoring (0 retries)
     mock_monitor = AsyncMock(side_effect=Exception("Connection timeout"))

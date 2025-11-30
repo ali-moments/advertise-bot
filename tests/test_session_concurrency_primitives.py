@@ -105,8 +105,8 @@ def test_get_operation_timeout():
         api_hash='test_hash'
     )
     
+    # Only scraping and sending operations use the operation queue
     assert session._get_operation_timeout('scraping') == 300.0
-    assert session._get_operation_timeout('monitoring') == 3600.0
     assert session._get_operation_timeout('sending') == 60.0
     assert session._get_operation_timeout('unknown') == 300.0  # default
 
@@ -119,7 +119,7 @@ def test_get_operation_priority():
         api_hash='test_hash'
     )
     
-    assert session._get_operation_priority('monitoring') == 10
+    # Only scraping and sending operations use the operation queue
     assert session._get_operation_priority('scraping') == 5
     assert session._get_operation_priority('sending') == 1
     assert session._get_operation_priority('unknown') == 0  # default

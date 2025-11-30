@@ -159,9 +159,13 @@ class TelegramSession:
         self.active_tasks: Set[asyncio.Task] = set()
         self.task_lock = asyncio.Lock()
         
-        # Operation synchronization (existing lock, now properly used)
+        # Operation synchronization for scraping and sending operations only
+        # BAN PREVENTION STRATEGY: This lock ensures scraping and sending operations
+        # never run simultaneously on the same session, which could trigger Telegram's
+        # anti-spam detection. Monitoring operations do NOT use this lock and run
+        # independently in the background, just like a real Telegram app.
         self.operation_lock = asyncio.Lock()
-        self.current_operation: Optional[str] = None
+        self.current_operation: Optional[str] = None  # 'scraping' or 'sending'
         self.operation_start_time: Optional[float] = None
         
         # Operation queuing system
@@ -195,15 +199,17 @@ class TelegramSession:
         """
         Get timeout for specific operation type
         
+        Only 'scraping' and 'sending' operations use the operation queue.
+        Monitoring operations run independently and have their own timeout handling.
+        
         Args:
-            operation_type: Type of operation ('scraping', 'monitoring', 'sending')
+            operation_type: Type of operation ('scraping' or 'sending')
             
         Returns:
             Timeout in seconds
         """
         timeouts = {
             'scraping': 300.0,  # 5 minutes
-            'monitoring': 3600.0,  # 1 hour
             'sending': 60.0,  # 1 minute
         }
         return timeouts.get(operation_type, self.operation_timeout)
@@ -212,14 +218,16 @@ class TelegramSession:
         """
         Get priority for specific operation type
         
+        Only 'scraping' and 'sending' operations use the operation queue.
+        Monitoring operations run independently and do not have a priority.
+        
         Args:
-            operation_type: Type of operation
+            operation_type: Type of operation ('scraping' or 'sending')
             
         Returns:
             Priority (higher = more important)
         """
         priorities = {
-            'monitoring': 10,
             'scraping': 5,
             'sending': 1,
         }
@@ -236,7 +244,7 @@ class TelegramSession:
         Execute an operation with timeout and proper error handling
         
         Args:
-            operation_type: Type of operation ('scraping', 'monitoring', 'sending')
+            operation_type: Type of operation ('scraping' or 'sending')
             operation_func: The operation function to execute
             *args: Positional arguments for operation_func
             **kwargs: Keyword arguments for operation_func
@@ -251,7 +259,7 @@ class TelegramSession:
         timeout = self._get_operation_timeout(operation_type)
         
         try:
-            self.logger.debug(f"⏱️ Executing {operation_type} with {timeout}s timeout")
+            self.logger.debug(f"[OPERATION] ⏱️ Executing {operation_type} with {timeout}s timeout")
             
             # Execute operation with timeout
             result = await asyncio.wait_for(
@@ -259,12 +267,12 @@ class TelegramSession:
                 timeout=timeout
             )
             
-            self.logger.debug(f"✅ {operation_type} completed within timeout")
+            self.logger.debug(f"[OPERATION] ✅ {operation_type} completed within timeout")
             return result
             
         except asyncio.TimeoutError:
             error_msg = f"{operation_type} operation timed out after {timeout}s"
-            self.logger.warning(f"⏱️ {error_msg}")
+            self.logger.warning(f"[OPERATION] ⏱️ {error_msg}")
             
             # Cancel the operation task if possible
             # Note: The task is already cancelled by asyncio.wait_for
@@ -272,7 +280,7 @@ class TelegramSession:
             raise TimeoutError(error_msg)
             
         except Exception as e:
-            self.logger.error(f"❌ {operation_type} operation failed: {e}")
+            self.logger.error(f"[OPERATION] ❌ {operation_type} operation failed: {e}")
             raise
 
     async def _submit_operation(
@@ -285,15 +293,34 @@ class TelegramSession:
         """
         Submit an operation to the queue or execute immediately if idle
         
+        BAN PREVENTION: This method only accepts 'scraping' and 'sending' operations,
+        which are mutually exclusive to prevent triggering Telegram's anti-spam detection.
+        The operation_lock ensures these operations never run simultaneously on the same session.
+        
+        Monitoring operations should NOT use this method as they run independently
+        without acquiring the operation_lock, allowing them to run concurrently with
+        scraping/sending operations just like a real Telegram app.
+        
         Args:
-            operation_type: Type of operation ('scraping', 'monitoring', 'sending')
+            operation_type: Type of operation ('scraping' or 'sending' only)
             operation_func: The actual operation function to execute
             *args: Positional arguments for operation_func
             **kwargs: Keyword arguments for operation_func
             
         Returns:
             Result from the operation
+            
+        Raises:
+            ValueError: If operation_type is not 'scraping' or 'sending'
         """
+        # Validate operation type (AC-5.1, AC-5.2)
+        if operation_type not in ['scraping', 'sending']:
+            raise ValueError(
+                f"Invalid operation type '{operation_type}'. "
+                f"Only 'scraping' and 'sending' operations are allowed in the operation queue. "
+                f"Monitoring operations run independently without using the operation queue."
+            )
+        
         # Check if we can execute immediately (operation lock is free)
         if not self.operation_lock.locked():
             # Try to acquire lock immediately
@@ -310,7 +337,7 @@ class TelegramSession:
                     self.current_operation = operation_type
                     self.operation_start_time = time.time()
                     
-                    self.logger.debug(f"▶️ Executing {operation_type} immediately (no queue)")
+                    self.logger.debug(f"[OPERATION] ▶️ Executing {operation_type} immediately (no queue)")
                     
                     # Use the timeout wrapper
                     result = await self._execute_with_timeout(
@@ -321,7 +348,7 @@ class TelegramSession:
                     )
                     
                     operation_duration = time.time() - self.operation_start_time
-                    self.logger.debug(f"✅ {operation_type} completed in {operation_duration:.1f}s")
+                    self.logger.debug(f"[OPERATION] ✅ {operation_type} completed in {operation_duration:.1f}s")
                     
                     return result
                     
@@ -340,7 +367,7 @@ class TelegramSession:
                     self._release_lock_with_logging(self.operation_lock, "operation")
         
         # Queue is busy, add to queue
-        self.logger.debug(f"📥 Queuing {operation_type} operation")
+        self.logger.debug(f"[OPERATION] 📥 Queuing {operation_type} operation")
         
         # Check queue depth before adding (Requirement 1.4)
         queue_depth = self.get_queue_depth()
@@ -395,7 +422,7 @@ class TelegramSession:
         Process operations from queue in priority order
         Runs continuously until session disconnects
         """
-        self.logger.debug("🔄 Queue processor started")
+        self.logger.debug("[OPERATION] 🔄 Queue processor started")
         
         while self.is_connected:
             lock_acquired = False
@@ -429,7 +456,7 @@ class TelegramSession:
                     queue_wait_time = time.time() - queued_op.queued_at
                     if queue_wait_time > self.queue_wait_timeout:
                         error_msg = f"Operation timed out in queue after {queue_wait_time:.1f}s"
-                        self.logger.warning(f"⏱️ {error_msg}")
+                        self.logger.warning(f"[OPERATION] ⏱️ {error_msg}")
                         if not queued_op.result_future.done():
                             queued_op.result_future.set_exception(TimeoutError(error_msg))
                         continue
@@ -439,7 +466,7 @@ class TelegramSession:
                     self.operation_start_time = time.time()
                     
                     self.logger.debug(
-                        f"▶️ Executing {queued_op.operation_type} operation "
+                        f"[OPERATION] ▶️ Executing {queued_op.operation_type} operation "
                         f"(waited {queue_wait_time:.1f}s in queue)"
                     )
                     
@@ -458,13 +485,13 @@ class TelegramSession:
                         
                         operation_duration = time.time() - self.operation_start_time
                         self.logger.debug(
-                            f"✅ {queued_op.operation_type} completed in {operation_duration:.1f}s"
+                            f"[OPERATION] ✅ {queued_op.operation_type} completed in {operation_duration:.1f}s"
                         )
                         
                     except TimeoutError as e:
                         # Log error with operation context (Requirement 7.1)
                         self.logger.warning(
-                            f"⏱️ {e} (session: {self.session_file}, "
+                            f"[OPERATION] ⏱️ {e} (session: {self.session_file}, "
                             f"operation: {queued_op.operation_type})"
                         )
                         if not queued_op.result_future.done():
@@ -473,7 +500,7 @@ class TelegramSession:
                     except Exception as e:
                         # Log error with operation context (Requirement 7.1)
                         self.logger.error(
-                            f"❌ Operation {queued_op.operation_type} failed: {e} "
+                            f"[OPERATION] ❌ Operation {queued_op.operation_type} failed: {e} "
                             f"(session: {self.session_file})"
                         )
                         if not queued_op.result_future.done():
@@ -489,14 +516,14 @@ class TelegramSession:
             except Exception as e:
                 # Log error with context (Requirement 7.1)
                 self.logger.error(
-                    f"❌ Error in queue processor: {e} (session: {self.session_file})"
+                    f"[OPERATION] ❌ Error in queue processor: {e} (session: {self.session_file})"
                 )
                 # Ensure lock is released even on unexpected errors (Requirement 7.1)
                 if lock_acquired:
                     self._release_lock_with_logging(self.operation_lock, "operation")
                 await asyncio.sleep(1)  # Brief delay before continuing
         
-        self.logger.debug("🛑 Queue processor stopped")
+        self.logger.debug("[OPERATION] 🛑 Queue processor stopped")
 
     async def _acquire_lock_with_timeout(self, lock: asyncio.Lock, timeout: float = 30.0, lock_name: str = "unknown") -> bool:
         """
@@ -619,7 +646,7 @@ class TelegramSession:
             try:
                 await asyncio.wait_for(self.queue_processor_task, timeout=5.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
-                self.logger.warning("⏱️ Queue processor did not cancel cleanly within 5 seconds")
+                self.logger.warning("[OPERATION] ⏱️ Queue processor did not cancel cleanly within 5 seconds")
         
         # Cancel all active tasks with timeout
         await self._cancel_all_tasks_with_timeout(timeout=5.0)
@@ -726,17 +753,44 @@ class TelegramSession:
         """
         Start monitoring channels/groups and react to new messages
         
+        CONCURRENT OPERATION MODEL:
+        Monitoring runs independently of the operation queue and does NOT acquire
+        the operation_lock. This allows monitoring to run concurrently with
+        scraping and sending operations, just like a real Telegram app that
+        continuously listens for messages while performing other actions.
+        
+        BAN PREVENTION:
+        Monitoring is a passive operation (listening + reacting) that doesn't
+        conflict with active operations (scraping/sending). It runs in the
+        background without blocking the operation queue.
+        
         Args:
-            targets: List of dicts with 'chat_id', 'reaction', and 'cooldown'
+            targets: List of dicts with 'chat_id', 'reaction_pool' (or 'reaction' for backward compatibility), and 'cooldown'
+                    - reaction_pool: Dict with 'reactions' list containing {'emoji': str, 'weight': int} dicts
+                    - reaction: Single emoji string (deprecated, use reaction_pool instead)
+                    - cooldown: Seconds between reactions (default: 2.0)
             
         Returns:
             bool: True if monitoring started successfully
+            
+        Example:
+            >>> targets = [
+            ...     {
+            ...         'chat_id': '@channel1',
+            ...         'reaction_pool': {
+            ...             'reactions': [
+            ...                 {'emoji': '👍', 'weight': 5},
+            ...                 {'emoji': '❤️', 'weight': 3}
+            ...             ]
+            ...         },
+            ...         'cooldown': 2.0
+            ...     }
+            ... ]
+            >>> await session.start_monitoring(targets)
+            True
         """
-        return await self._submit_operation(
-            'monitoring',
-            self._start_monitoring_impl,
-            targets
-        )
+        # Call implementation directly without queuing (AC-1.1, AC-1.2, AC-5.2)
+        return await self._start_monitoring_impl(targets)
 
     async def _start_monitoring_impl(self, targets: List[Dict]) -> bool:
         """
@@ -744,7 +798,7 @@ class TelegramSession:
         This is the actual work that gets queued/executed
         
         Args:
-            targets: List of dicts with 'chat_id', 'reaction', and 'cooldown'
+            targets: List of dicts with 'chat_id', 'reaction_pool' (or 'reaction' for backward compatibility), and 'cooldown'
             
         Returns:
             bool: True if monitoring started successfully
@@ -755,11 +809,8 @@ class TelegramSession:
         try:
             # Setup monitoring targets
             for target in targets:
-                monitoring_target = MonitoringTarget(
-                    chat_id=target['chat_id'],
-                    reaction=target.get('reaction', '👍'),
-                    cooldown=target.get('cooldown', 2.0)
-                )
+                # Use MonitoringTarget.from_dict for proper handling of reaction_pool
+                monitoring_target = MonitoringTarget.from_dict(target)
                 self.monitoring_targets[target['chat_id']] = monitoring_target
 
             # Setup event handler (now async)
@@ -773,7 +824,7 @@ class TelegramSession:
                     while self.is_monitoring:
                         await asyncio.sleep(60)  # Check every minute
                 except asyncio.CancelledError:
-                    self.logger.debug("Monitoring keepalive cancelled")
+                    self.logger.debug("[MONITOR] Monitoring keepalive cancelled")
                     raise
             
             self.monitoring_task = self._create_task(
@@ -783,11 +834,11 @@ class TelegramSession:
             )
             
             self.is_monitoring = True
-            self.logger.info(f"🎯 Started monitoring {len(targets)} targets")
+            self.logger.info(f"[MONITOR] 🎯 Started monitoring {len(targets)} targets")
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to start monitoring: {e}")
+            self.logger.error(f"[MONITOR] ❌ Failed to start monitoring: {e}")
             return False
 
     async def stop_monitoring(self):
@@ -800,7 +851,7 @@ class TelegramSession:
                 try:
                     await asyncio.wait_for(self.monitoring_task, timeout=5.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
-                    self.logger.debug("Monitoring task cancelled")
+                    self.logger.debug("[MONITOR] Monitoring task cancelled")
                 self.monitoring_task = None
             
             # Remove event handler
@@ -810,7 +861,7 @@ class TelegramSession:
             
             self.monitoring_targets.clear()
             self.is_monitoring = False
-            self.logger.info("🛑 Stopped monitoring")
+            self.logger.info("[MONITOR] 🛑 Stopped monitoring")
 
     async def _setup_event_handler(self):
         """Setup isolated event handler for this session"""
@@ -848,17 +899,31 @@ class TelegramSession:
                     if current_time - target.last_reaction_time < target.cooldown:
                         return
                     
+                    # Select reaction from pool using weighted random selection
+                    selected_reaction = target.get_next_reaction()
+                    
                     # React to the message
-                    success = await self._safe_react_to_message(chat, event.message.id, target.reaction)
+                    success = await self._safe_react_to_message(chat, event.message.id, selected_reaction)
                     if success:
                         target.last_reaction_time = current_time
-                        self.logger.debug(f"🔔 Reacted to new message in {chat_identifier}")
+                        # Log which reaction was selected from the pool with structured logging (Requirement 8.5)
+                        self.logger.info(
+                            f"[MONITOR] 🔔 Reacted to new message in {chat_identifier} with {selected_reaction}",
+                            extra={
+                                'operation_type': 'reaction',
+                                'chat_identifier': chat_identifier,
+                                'selected_reaction': selected_reaction,
+                                'reaction_pool_size': len(target.reaction_pool.reactions) if target.reaction_pool else 1,
+                                'message_id': event.message.id,
+                                'cooldown': target.cooldown
+                            }
+                        )
                     
                 except Exception as e:
                     # Track error count per session
                     self._handler_error_count += 1
                     # Log errors without crashing event loop
-                    self.logger.error(f"❌ Error in message handler (count: {self._handler_error_count}): {e}")
+                    self.logger.error(f"[MONITOR] ❌ Error in message handler (count: {self._handler_error_count}): {e}")
 
             self._event_handler = message_handler
 
@@ -938,6 +1003,125 @@ class TelegramSession:
         except Exception as e:
             self.logger.error(f"❌ Failed to send message to {target}: {e}")
             return False
+
+    async def send_text_message(self, recipient: str, message: str) -> Dict:
+        """
+        Send a text message to a recipient
+        
+        Args:
+            recipient: User identifier (username, user ID, or phone number)
+            message: Text message to send
+            
+        Returns:
+            Dict with success status, recipient, and error if any
+        """
+        try:
+            self.logger.info(f"📤 Sending text message to {recipient}")
+            entity = await self.client.get_entity(recipient)
+            await self.client.send_message(entity, message)
+            self.logger.info(f"✅ Text message sent successfully to {recipient}")
+            return {
+                'success': True,
+                'recipient': recipient,
+                'error': None
+            }
+        except Exception as e:
+            self.logger.error(f"❌ Failed to send text message to {recipient}: {e}")
+            return {
+                'success': False,
+                'recipient': recipient,
+                'error': str(e)
+            }
+
+    async def send_image_message(self, recipient: str, image_path: str, caption: Optional[str] = None) -> Dict:
+        """
+        Send an image with optional caption to a recipient
+        
+        Args:
+            recipient: User identifier (username, user ID, or phone number)
+            image_path: Path to image file or URL
+            caption: Optional caption text
+            
+        Returns:
+            Dict with success status, recipient, and error if any
+        """
+        try:
+            self.logger.info(f"📤 Sending image to {recipient} (caption: {bool(caption)})")
+            entity = await self.client.get_entity(recipient)
+            await self.client.send_file(entity, image_path, caption=caption)
+            self.logger.info(f"✅ Image sent successfully to {recipient}")
+            return {
+                'success': True,
+                'recipient': recipient,
+                'error': None
+            }
+        except Exception as e:
+            self.logger.error(f"❌ Failed to send image to {recipient}: {e}")
+            return {
+                'success': False,
+                'recipient': recipient,
+                'error': str(e)
+            }
+
+    async def send_document_message(self, recipient: str, document_path: str, caption: Optional[str] = None) -> Dict:
+        """
+        Send a document with optional caption to a recipient
+        
+        Args:
+            recipient: User identifier (username, user ID, or phone number)
+            document_path: Path to document file
+            caption: Optional caption text
+            
+        Returns:
+            Dict with success status, recipient, and error if any
+        """
+        try:
+            self.logger.info(f"📤 Sending document to {recipient} (caption: {bool(caption)})")
+            entity = await self.client.get_entity(recipient)
+            await self.client.send_file(entity, document_path, caption=caption, force_document=True)
+            self.logger.info(f"✅ Document sent successfully to {recipient}")
+            return {
+                'success': True,
+                'recipient': recipient,
+                'error': None
+            }
+        except Exception as e:
+            self.logger.error(f"❌ Failed to send document to {recipient}: {e}")
+            return {
+                'success': False,
+                'recipient': recipient,
+                'error': str(e)
+            }
+
+    async def send_video_message(self, recipient: str, video_path: str, caption: Optional[str] = None) -> Dict:
+        """
+        Send a video with optional caption to a recipient
+        
+        Args:
+            recipient: User identifier (username, user ID, or phone number)
+            video_path: Path to video file
+            caption: Optional caption text
+            
+        Returns:
+            Dict with success status, recipient, and error if any
+        """
+        try:
+            self.logger.info(f"📤 Sending video to {recipient} (caption: {bool(caption)})")
+            entity = await self.client.get_entity(recipient)
+            await self.client.send_file(entity, video_path, caption=caption)
+            self.logger.info(f"✅ Video sent successfully to {recipient}")
+            return {
+                'success': True,
+                'recipient': recipient,
+                'error': None
+            }
+        except Exception as e:
+            self.logger.error(f"❌ Failed to send video to {recipient}: {e}")
+            return {
+                'success': False,
+                'recipient': recipient,
+                'error': str(e)
+            }
 
     async def join_chat(self, target: str) -> bool:
         """
@@ -1036,16 +1220,18 @@ class TelegramSession:
 
     def get_status(self) -> Dict:
         """
-        Get current session status
+        Get current session status (AC-7.1, AC-7.2)
         
         Returns:
-            Dict with session status information
+            Dict with session status information including separate monitoring and operation states
         """
         return {
             'connected': self.is_connected,
             'monitoring': self.is_monitoring,
             'monitoring_targets_count': len(self.monitoring_targets),
-            'active_tasks': len(self.active_tasks)
+            'active_tasks': len(self.active_tasks),
+            'current_operation': self.current_operation,
+            'operation_start_time': self.operation_start_time
         }
     
     def get_active_task_count(self) -> int:
@@ -1108,10 +1294,10 @@ class TelegramSession:
     
     def get_queue_status(self) -> Dict:
         """
-        Get detailed queue status information (Requirement 1.4)
+        Get detailed queue status information (Requirement 1.4, AC-7.1)
         
         Returns:
-            Dict with queue status details
+            Dict with queue status details including monitoring state
         """
         queue_depth = self.get_queue_depth()
         return {
@@ -1120,7 +1306,9 @@ class TelegramSession:
             'queue_utilization': queue_depth / 100.0,
             'is_full': queue_depth >= 100,
             'current_operation': self.current_operation,
-            'operation_start_time': self.operation_start_time
+            'operation_start_time': self.operation_start_time,
+            'monitoring_active': self.is_monitoring,
+            'monitoring_targets_count': len(self.monitoring_targets)
         }
     
     async def scrape_group_members(self, group_identifier: str, max_members: int = 10000, fallback_to_messages: bool = True, message_days_back: int = 10) -> Dict:

@@ -1,555 +1,365 @@
 """
-Telegram Manager - Complete Examples and Testing Script
+Telegram Manager - Quick Start Guide
 
-This file demonstrates all features of the Telegram Manager system.
-Fill in the 'data' dictionary with real values to test with actual data.
+This is a simple guide showing the most common use cases.
+Replace the placeholder values with your actual data.
+
+CONCURRENT OPERATION MODEL:
+===========================
+The system supports concurrent operations that mimic real Telegram app behavior:
+
+✅ ALLOWED CONCURRENT OPERATIONS:
+- Monitoring + Scraping (monitoring runs in background while scraping)
+- Monitoring + Sending (monitoring runs in background while sending)
+
+❌ PREVENTED CONCURRENT OPERATIONS (Ban Prevention):
+- Scraping + Sending (these are serialized via operation queue)
+
+This ensures your sessions behave naturally and avoid triggering Telegram's
+anti-spam detection while maximizing efficiency.
 """
 
 import asyncio
 import logging
 from telegram_manager.main import TelegramManagerApp
 
-# Setup logging
+# Setup logging to see what's happening
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# ============================================================================
-# DATA CONFIGURATION - Fill this with your real data for testing
-# ============================================================================
 
-data = {
-    # Monitoring targets - channels/groups to monitor and react to
-    'monitoring_targets': [
-        {
-            'chat_id': '@example_channel',  # Replace with actual channel username
-            'reaction': '👍',
-            'cooldown': 2.0
-        },
-        # Add more monitoring targets here
-    ],
+async def main():
+    """Main function - choose what you want to do"""
     
-    # Message sending targets
-    'message_targets': [
-        '@user1',  # Replace with actual usernames or chat IDs
-        '@user2',
-        # Add more targets here
-    ],
-    
-    # Message to send
-    'test_message': 'Hello! This is a test message from Telegram Manager.',
-    
-    # Groups/channels to get members from
-    'member_chats': [
-        '@example_group',  # Replace with actual group usernames
-        # Add more groups here
-    ],
-    
-    # Groups/channels to join
-    'chats_to_join': [
-        'https://t.me/example_group',  # Replace with actual invite links
-        # Add more groups here
-    ],
-    
-    # Groups to scrape members from
-    'groups_to_scrape': [
-        '@example_group',  # Replace with actual group identifiers
-        'https://t.me/+AbCdEfGhIjKlMnOp',  # Private group invite link
-        # Add more groups here
-    ],
-    
-    # Link channels (لینک دونی) - channels that share group links
-    'link_channels': [
-        '@link_sharing_channel',  # Replace with actual link-sharing channels
-        # Add more channels here
-    ],
-    
-    # Targets to check type (scrapable or not)
-    'targets_to_check': [
-        '@example_channel',
-        '@example_group',
-        'https://t.me/example',
-        # Add more targets here
-    ],
-}
-
-# ============================================================================
-# EXAMPLE FUNCTIONS - Demonstrating all features
-# ============================================================================
-
-async def example_1_initialize_and_load_sessions():
-    """
-    Example 1: Initialize the application and load sessions from database
-    
-    Features demonstrated:
-    - Initialize TelegramManagerApp
-    - Load sessions from database
-    - Get session statistics
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 1: Initialize and Load Sessions")
-    print("="*80)
-    
+    # Step 1: Initialize the app (loads your sessions from database)
+    print("🚀 Initializing Telegram Manager...")
     app = TelegramManagerApp()
-    
-    # Initialize from database
     success = await app.initialize()
     
-    if success:
-        print("✅ Application initialized successfully")
-        
-        # Show session stats
-        await app.show_stats()
-    else:
-        print("❌ Failed to initialize application")
-    
-    return app
-
-
-async def example_2_monitoring(app: TelegramManagerApp):
-    """
-    Example 2: Start and stop monitoring on channels/groups
-    
-    Features demonstrated:
-    - Start global monitoring across all sessions
-    - Monitor multiple targets with different reactions
-    - Stop monitoring
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 2: Monitoring Channels/Groups")
-    print("="*80)
-    
-    if not data['monitoring_targets']:
-        print("⚠️  No monitoring targets configured in data dict")
+    if not success:
+        print("❌ Failed to initialize. Check your database and sessions.")
         return
     
-    # Start monitoring
-    print(f"Starting monitoring on {len(data['monitoring_targets'])} targets...")
+    print("✅ Initialized successfully!\n")
+    
+    try:
+        # ============================================================
+        # CHOOSE YOUR OPERATION - Uncomment the one you want to use
+        # ============================================================
+        
+        # --- 1. SEND TEXT MESSAGES TO USERS ---
+        # await send_text_messages(app)
+        
+        # --- 2. SEND IMAGES TO USERS ---
+        # await send_images(app)
+        
+        # --- 3. SEND MESSAGES FROM CSV FILE ---
+        # await send_from_csv(app)
+        
+        # --- 4. MONITOR CHANNELS AND AUTO-REACT ---
+        # await monitor_channels(app)
+        
+        # --- 5. SCRAPE GROUP MEMBERS ---
+        # await scrape_groups(app)
+        
+        # --- 6. CHECK SESSION STATUS ---
+        await check_status(app)
+        
+        # --- 7. CONCURRENT MONITORING + SCRAPING ---
+        # await concurrent_monitoring_and_scraping(app)
+        
+        # --- 8. CONCURRENT MONITORING + SENDING ---
+        # await concurrent_monitoring_and_sending(app)
+        
+    finally:
+        # Always cleanup when done
+        print("\n🛑 Shutting down...")
+        await app.shutdown()
+        print("✅ Done!")
+
+
+# ============================================================
+# OPERATION EXAMPLES - Simple and clear
+# ============================================================
+
+async def send_text_messages(app):
+    """Send a text message to multiple users"""
+    print("📤 SENDING TEXT MESSAGES\n")
+    
+    # Your recipients (usernames or user IDs)
+    recipients = [
+        '@username1',
+        '@username2',
+        '123456789',  # User ID
+    ]
+    
+    # Your message
+    message = "Hello! This is a test message."
+    
+    # Send it
+    result = await app.send_text_to_users(
+        recipients=recipients,
+        message=message,
+        delay=2.0  # Wait 2 seconds between each send
+    )
+    
+    # Check results
+    print(f"✅ Sent: {result['succeeded']}")
+    print(f"❌ Failed: {result['failed']}")
+
+
+async def send_images(app):
+    """Send an image with caption to multiple users"""
+    print("🖼️ SENDING IMAGES\n")
+    
+    recipients = [
+        '@username1',
+        '@username2',
+    ]
+    
+    # Path to your image
+    image_path = '/path/to/your/image.jpg'
+    caption = "Check out this image!"
+    
+    result = await app.send_image_to_users(
+        recipients=recipients,
+        image_path=image_path,
+        caption=caption,
+        delay=2.0
+    )
+    
+    print(f"✅ Sent: {result['succeeded']}")
+    print(f"❌ Failed: {result['failed']}")
+
+
+async def send_from_csv(app):
+    """Send messages to users listed in a CSV file"""
+    print("📋 SENDING FROM CSV FILE\n")
+    
+    # Your CSV file should have a column with usernames or user IDs
+    csv_path = '/path/to/your/users.csv'
+    message = "Hello from CSV!"
+    
+    result = await app.send_from_csv_file(
+        csv_path=csv_path,
+        message=message,
+        batch_size=100,  # Process 100 users at a time
+        resumable=True   # Can resume if interrupted
+    )
+    
+    print(f"✅ Sent: {result['succeeded']}")
+    print(f"❌ Failed: {result['failed']}")
+
+
+async def monitor_channels(app):
+    """Monitor channels and automatically react to new messages"""
+    print("👀 MONITORING CHANNELS\n")
+    
+    # Configure which channels to monitor and what reactions to use
+    # Note: You need to configure this in your database first
+    # This example just shows how to start/stop monitoring
+    
+    print("Starting monitoring...")
     await app.start_monitoring()
     
-    # Let it run for a while
-    print("Monitoring active for 30 seconds...")
-    await asyncio.sleep(30)
+    # Let it run for 60 seconds
+    print("Monitoring active for 60 seconds...")
+    await asyncio.sleep(60)
     
-    # Stop monitoring
     print("Stopping monitoring...")
     await app.stop_monitoring()
     print("✅ Monitoring stopped")
 
 
-async def example_3_send_bulk_messages(app: TelegramManagerApp):
+async def concurrent_monitoring_and_scraping(app):
     """
-    Example 3: Send messages to multiple targets
+    Example: Monitor channels while scraping groups concurrently
     
-    Features demonstrated:
-    - Bulk message sending
-    - Load balancing across sessions
-    - Result tracking
+    This demonstrates the concurrent operation model where monitoring
+    runs continuously in the background while other operations execute.
     """
-    print("\n" + "="*80)
-    print("EXAMPLE 3: Send Bulk Messages")
-    print("="*80)
+    print("🔄 CONCURRENT MONITORING + SCRAPING\n")
     
-    if not data['message_targets']:
-        print("⚠️  No message targets configured in data dict")
-        return
+    # Start monitoring first
+    print("Starting monitoring...")
+    await app.start_monitoring()
+    print("✅ Monitoring is now active in the background\n")
     
-    results = await app.send_bulk_messages(
-        targets=data['message_targets'],
-        message=data['test_message']
+    # Now scrape a group while monitoring continues
+    print("Scraping group members (monitoring continues in background)...")
+    scrape_result = await app.scrape_group_members(
+        group_identifier='@your_group',
+        max_members=1000
     )
     
-    print(f"\n📊 Results:")
-    for target, result in results.items():
-        status = "✅" if result['success'] else "❌"
-        print(f"{status} {target}: {result.get('error', 'Success')}")
+    if scrape_result['success']:
+        print(f"✅ Scraped {scrape_result['members_count']} members")
+        print(f"📁 Saved to: {scrape_result['file_path']}")
+    
+    # Monitoring is still active!
+    print("\n✅ Monitoring continued throughout the scraping operation")
+    
+    # Stop monitoring when done
+    await app.stop_monitoring()
+    print("✅ Monitoring stopped")
 
 
-async def example_4_get_chat_members(app: TelegramManagerApp):
+async def concurrent_monitoring_and_sending(app):
     """
-    Example 4: Get member lists from chats
+    Example: Monitor channels while sending messages concurrently
     
-    Features demonstrated:
-    - Bulk member retrieval
-    - Session distribution
+    Monitoring runs in the background while messages are sent.
     """
-    print("\n" + "="*80)
-    print("EXAMPLE 4: Get Chat Members")
-    print("="*80)
+    print("🔄 CONCURRENT MONITORING + SENDING\n")
     
-    if not data['member_chats']:
-        print("⚠️  No member chats configured in data dict")
-        return
+    # Start monitoring
+    print("Starting monitoring...")
+    await app.start_monitoring()
+    print("✅ Monitoring is now active in the background\n")
     
-    members_data = await app.get_chat_members(
-        chats=data['member_chats'],
-        limit=100
+    # Send messages while monitoring continues
+    print("Sending messages (monitoring continues in background)...")
+    recipients = ['@user1', '@user2', '@user3']
+    message = "Hello! This message was sent while monitoring was active."
+    
+    result = await app.send_text_to_users(
+        recipients=recipients,
+        message=message,
+        delay=2.0
     )
     
-    print(f"\n📊 Results:")
-    for chat, members in members_data.items():
-        print(f"👥 {chat}: {len(members)} members")
+    print(f"✅ Sent: {result['succeeded']}")
+    print(f"❌ Failed: {result['failed']}")
+    
+    # Monitoring is still active!
+    print("\n✅ Monitoring continued throughout the sending operation")
+    
+    # Stop monitoring
+    await app.stop_monitoring()
+    print("✅ Monitoring stopped")
 
 
-async def example_5_join_chats(app: TelegramManagerApp):
-    """
-    Example 5: Join multiple chats/groups
+async def scrape_groups(app):
+    """Scrape members from Telegram groups"""
+    print("🔍 SCRAPING GROUP MEMBERS\n")
     
-    Features demonstrated:
-    - Bulk chat joining
-    - Handle invite links
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 5: Join Multiple Chats")
-    print("="*80)
-    
-    if not data['chats_to_join']:
-        print("⚠️  No chats to join configured in data dict")
-        return
-    
-    results = await app.join_multiple_chats(data['chats_to_join'])
-    
-    print(f"\n📊 Results:")
-    for chat, success in results.items():
-        status = "✅" if success else "❌"
-        print(f"{status} {chat}")
-
-
-async def example_6_scrape_group_members(app: TelegramManagerApp):
-    """
-    Example 6: Scrape members from a single group
-    
-    Features demonstrated:
-    - Member scraping with fallback to message-based scraping
-    - Load-balanced session selection
-    - CSV export
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 6: Scrape Group Members")
-    print("="*80)
-    
-    if not data['groups_to_scrape']:
-        print("⚠️  No groups to scrape configured in data dict")
-        return
-    
-    group = data['groups_to_scrape'][0]
+    # Group to scrape (username or invite link)
+    group = '@your_group_username'
+    # or: group = 'https://t.me/+InviteLinkHere'
     
     result = await app.scrape_group_members(
         group_identifier=group,
-        join_first=False,  # Set to True to join before scraping
+        join_first=False,  # Set True to join before scraping
         max_members=10000
     )
     
     if result['success']:
-        print(f"✅ Scraped {result.get('members_count', 0)} members")
+        print(f"✅ Scraped {result['members_count']} members")
         print(f"📁 Saved to: {result['file_path']}")
     else:
-        print(f"❌ Failed: {result.get('error', 'Unknown error')}")
+        print(f"❌ Failed: {result['error']}")
 
 
-async def example_7_bulk_scrape_groups(app: TelegramManagerApp):
-    """
-    Example 7: Scrape multiple groups with load balancing
-    
-    Features demonstrated:
-    - Bulk group scraping
-    - Load balancing across sessions
-    - Daily limit enforcement
-    - Retry logic
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 7: Bulk Scrape Multiple Groups")
-    print("="*80)
-    
-    if not data['groups_to_scrape']:
-        print("⚠️  No groups to scrape configured in data dict")
-        return
-    
-    results = await app.bulk_scrape_groups(
-        groups=data['groups_to_scrape'],
-        join_first=False,
-        max_members=10000
-    )
-    
-    print(f"\n📊 Results:")
-    for group, result in results.items():
-        if result.get('success'):
-            print(f"✅ {group}: {result.get('members_count', 0)} members -> {result['file_path']}")
-        else:
-            print(f"❌ {group}: {result.get('error', 'Unknown error')}")
-
-
-async def example_8_extract_group_links(app: TelegramManagerApp):
-    """
-    Example 8: Extract group links from link-sharing channels
-    
-    Features demonstrated:
-    - Extract Telegram links from messages
-    - Parse different link formats
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 8: Extract Group Links from Channels")
-    print("="*80)
-    
-    if not data['link_channels']:
-        print("⚠️  No link channels configured in data dict")
-        return
-    
-    channel = data['link_channels'][0]
-    
-    result = await app.extract_group_links(
-        target=channel,
-        limit_messages=100
-    )
-    
-    if result['success']:
-        print(f"✅ Found {len(result['telegram_links'])} links")
-        print(f"📋 Links: {result['telegram_links'][:5]}...")  # Show first 5
-    else:
-        print(f"❌ Failed: {result.get('error', 'Unknown error')}")
-
-
-async def example_9_extract_and_scrape_workflow(app: TelegramManagerApp):
-    """
-    Example 9: Complete workflow - Extract links then scrape all found groups
-    
-    Features demonstrated:
-    - Multi-step workflow
-    - Link extraction from multiple channels
-    - Automatic scraping of discovered groups
-    - Deduplication
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 9: Extract Links and Scrape Workflow")
-    print("="*80)
-    
-    if not data['link_channels']:
-        print("⚠️  No link channels configured in data dict")
-        return
-    
-    result = await app.bulk_scrape_from_link_channels(
-        link_channels=data['link_channels'],
-        join_first=True,  # Join groups before scraping
-        limit_messages=100,
-        max_members=10000
-    )
-    
-    print(f"\n📊 Workflow Results:")
-    print(f"🔗 Groups found: {result['total_groups_found']}")
-    print(f"✅ Groups scraped: {result['total_groups_scraped']}")
-    
-    # Show scraping results
-    for group, scrape_result in result['scraping_results'].items():
-        if scrape_result.get('success'):
-            print(f"  ✅ {group}: {scrape_result.get('members_count', 0)} members")
-
-
-async def example_10_check_target_types(app: TelegramManagerApp):
-    """
-    Example 10: Check if targets are scrapable
-    
-    Features demonstrated:
-    - Target type checking
-    - Identify channels vs groups
-    - Filter scrapable targets
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 10: Check Target Types")
-    print("="*80)
-    
-    if not data['targets_to_check']:
-        print("⚠️  No targets to check configured in data dict")
-        return
-    
-    results = await app.bulk_check_targets(data['targets_to_check'])
-    
-    print(f"\n📊 Target Check Results:")
-    for target, result in results.items():
-        if result.get('success'):
-            scrapable = "✅ Scrapable" if result.get('scrapable') else "❌ Not scrapable"
-            target_type = result.get('target_type', 'unknown')
-            print(f"{scrapable} - {target} ({target_type})")
-        else:
-            print(f"❌ {target}: {result.get('error', 'Unknown error')}")
-
-
-async def example_11_safe_scrape_with_filter(app: TelegramManagerApp):
-    """
-    Example 11: Safe scraping workflow with automatic filtering
-    
-    Features demonstrated:
-    - Automatic target type checking
-    - Filter out non-scrapable targets
-    - Only scrape valid groups
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 11: Safe Scrape with Filtering")
-    print("="*80)
-    
-    if not data['targets_to_check']:
-        print("⚠️  No targets configured in data dict")
-        return
-    
-    result = await app.safe_bulk_scrape_with_filter(
-        targets=data['targets_to_check'],
-        join_first=False,
-        max_members=10000
-    )
-    
-    print(f"\n📊 Safe Scrape Results:")
-    print(f"🔍 Targets checked: {result['total_checked']}")
-    print(f"✅ Scrapable targets: {result['total_scrapable']}")
-    print(f"📥 Successfully scraped: {result['total_scraped']}")
-
-
-async def example_12_session_statistics(app: TelegramManagerApp):
-    """
-    Example 12: Get detailed session statistics
-    
-    Features demonstrated:
-    - Session status monitoring
-    - Daily usage tracking
-    - Load balancing metrics
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 12: Session Statistics")
-    print("="*80)
+async def check_status(app):
+    """Check the status of your sessions"""
+    print("📊 SESSION STATUS\n")
     
     stats = await app.get_session_stats()
     
-    print(f"\n📊 Session Statistics:")
-    for session_name, session_stats in stats.items():
-        print(f"\n📱 Session: {session_name}")
-        print(f"  Connected: {session_stats.get('connected', False)}")
-        print(f"  Monitoring: {session_stats.get('monitoring', False)}")
-        print(f"  Active tasks: {session_stats.get('active_tasks', 0)}")
-        
-        if 'daily_stats' in session_stats:
-            daily = session_stats['daily_stats']
-            print(f"  Daily messages read: {daily['messages_read']}/{daily['max_messages_per_day']}")
-            print(f"  Daily groups scraped: {daily['groups_scraped_today']}/{daily['max_groups_per_day']}")
+    for session_name, info in stats.items():
+        print(f"\n📱 {session_name}")
+        print(f"   Connected: {'✅' if info['connected'] else '❌'}")
+        print(f"   Monitoring: {'✅' if info['monitoring'] else '❌'}")
+        print(f"   Active tasks: {info['active_tasks']}")
 
 
-async def example_13_manager_metrics(app: TelegramManagerApp):
-    """
-    Example 13: Get manager-level metrics
+# ============================================================
+# ADVANCED EXAMPLES
+# ============================================================
+# 
+# BAN PREVENTION STRATEGY:
+# The system automatically prevents risky operation combinations:
+# - Scraping and sending NEVER run simultaneously on the same session
+# - Monitoring runs independently and can overlap with both
+# - This mimics real Telegram app behavior and avoids anti-spam detection
+# ============================================================
+
+async def preview_before_sending(app):
+    """Preview what will happen before actually sending"""
+    print("👁️ PREVIEW MODE\n")
     
-    Features demonstrated:
-    - Operation metrics tracking
-    - Active operation counts
-    - Global task tracking
-    """
-    print("\n" + "="*80)
-    print("EXAMPLE 13: Manager Metrics")
-    print("="*80)
+    recipients = ['@user1', '@user2', '@user3']
+    message = "Test message"
     
-    if not app.manager:
-        print("❌ Manager not initialized")
-        return
+    # Preview without sending
+    preview = await app.preview_send(
+        recipients=recipients,
+        message=message
+    )
     
-    # Get operation metrics
-    metrics = await app.manager.get_operation_metrics()
-    print(f"\n📊 Operation Metrics:")
-    for op_type, count in metrics.items():
-        print(f"  {op_type}: {count} active")
+    print(f"Will send to: {preview['recipient_count']} users")
+    print(f"Estimated time: {preview['estimated_duration']:.1f} seconds")
+    print(f"Session distribution: {preview['session_distribution']}")
     
-    # Get scrape count
-    scrape_count = app.manager.get_active_scrape_count()
-    print(f"\n🔍 Active scrape operations: {scrape_count}")
-    
-    # Get global task count
-    task_count = await app.manager.get_global_task_count()
-    print(f"📋 Global task count: {task_count}")
+    # If preview looks good, actually send
+    # result = await app.send_text_to_users(recipients, message)
 
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
-async def run_all_examples():
-    """
-    Run all examples in sequence
+async def configure_reaction_pool(app):
+    """Configure multiple reactions for a channel"""
+    print("🎭 CONFIGURING REACTION POOL\n")
     
-    Note: Comment out examples you don't want to run
-    """
-    print("\n" + "="*80)
-    print("TELEGRAM MANAGER - COMPLETE EXAMPLES")
-    print("="*80)
+    channel = '@your_channel'
     
-    # Initialize
-    app = await example_1_initialize_and_load_sessions()
+    # Configure multiple reactions with weights
+    # Higher weight = more likely to be selected
+    reactions = [
+        {'emoji': '👍', 'weight': 5},  # 50% chance
+        {'emoji': '❤️', 'weight': 3},  # 30% chance
+        {'emoji': '🔥', 'weight': 2},  # 20% chance
+    ]
     
-    if not app or not app.manager:
-        print("❌ Failed to initialize, stopping examples")
-        return
+    await app.configure_reaction_pool(
+        chat_id=channel,
+        reactions=reactions,
+        cooldown=2.0
+    )
     
-    try:
-        # Run examples (comment out the ones you don't want to run)
-        
-        # await example_2_monitoring(app)
-        # await example_3_send_bulk_messages(app)
-        # await example_4_get_chat_members(app)
-        # await example_5_join_chats(app)
-        # await example_6_scrape_group_members(app)
-        # await example_7_bulk_scrape_groups(app)
-        # await example_8_extract_group_links(app)
-        # await example_9_extract_and_scrape_workflow(app)
-        # await example_10_check_target_types(app)
-        # await example_11_safe_scrape_with_filter(app)
-        await example_12_session_statistics(app)
-        await example_13_manager_metrics(app)
-        
-    finally:
-        # Cleanup
-        print("\n" + "="*80)
-        print("CLEANUP")
-        print("="*80)
-        await app.shutdown()
-        print("✅ Application shutdown complete")
+    print(f"✅ Configured reaction pool for {channel}")
 
 
-async def run_single_example(example_number: int):
-    """
-    Run a single example by number
+async def bulk_operations(app):
+    """Send to many users efficiently"""
+    print("⚡ BULK OPERATIONS\n")
     
-    Args:
-        example_number: Number of the example to run (1-13)
-    """
-    app = await example_1_initialize_and_load_sessions()
+    # For large lists, the system automatically:
+    # - Distributes work across all your sessions
+    # - Handles rate limits
+    # - Retries failures
+    # - Tracks progress
     
-    if not app or not app.manager:
-        print("❌ Failed to initialize")
-        return
+    recipients = [f'@user{i}' for i in range(1000)]  # 1000 users
+    message = "Bulk message"
     
-    try:
-        examples = {
-            2: example_2_monitoring,
-            3: example_3_send_bulk_messages,
-            4: example_4_get_chat_members,
-            5: example_5_join_chats,
-            6: example_6_scrape_group_members,
-            7: example_7_bulk_scrape_groups,
-            8: example_8_extract_group_links,
-            9: example_9_extract_and_scrape_workflow,
-            10: example_10_check_target_types,
-            11: example_11_safe_scrape_with_filter,
-            12: example_12_session_statistics,
-            13: example_13_manager_metrics,
-        }
-        
-        if example_number in examples:
-            await examples[example_number](app)
-        else:
-            print(f"❌ Example {example_number} not found")
+    result = await app.send_text_to_users(
+        recipients=recipients,
+        message=message,
+        delay=2.0
+    )
     
-    finally:
-        await app.shutdown()
+    print(f"✅ Sent: {result['succeeded']}/{len(recipients)}")
+    print(f"❌ Failed: {result['failed']}")
 
+
+# ============================================================
+# RUN IT
+# ============================================================
 
 if __name__ == "__main__":
-    # Run all examples
-    asyncio.run(run_all_examples())
+    # Run the main function
+    asyncio.run(main())
     
-    # Or run a single example:
-    # asyncio.run(run_single_example(12))
+    # Or run a specific operation:
+    # asyncio.run(send_text_messages(TelegramManagerApp()))

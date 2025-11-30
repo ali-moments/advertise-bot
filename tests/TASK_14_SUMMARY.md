@@ -1,229 +1,137 @@
-# Task 14: Integration Testing with Real Scenarios - Summary
+# Task 14: Session Failure Recovery - Implementation Summary
 
 ## Overview
-Implemented comprehensive integration tests to validate the concurrency fixes under realistic load conditions. All tests pass successfully, demonstrating that the system can handle:
-- 250 sessions monitoring simultaneously
-- Scraping while monitoring
-- Concurrent scraping with proper limit enforcement
-- Error recovery with lock release
-- Graceful shutdown with resource cleanup
+Implemented comprehensive session failure recovery functionality that handles session failures gracefully by redistributing operations, marking failed sessions as unavailable, and reintegrating recovered sessions.
 
-## Test File
-- **File**: `tests/test_integration_scenarios.py`
-- **Total Tests**: 6 integration tests
-- **Status**: ✅ All tests passing
+## Requirements Implemented
+- **Requirement 23.1**: Operation redistribution when session fails
+- **Requirement 23.2**: Mark failed sessions as unavailable in load balancer
+- **Requirement 23.3**: Session reintegration when recovered
+- **Requirement 23.4**: Queuing when all sessions are unavailable
+- **Requirement 23.5**: Operation order preservation during redistribution
 
-## Test Coverage
+## Implementation Details
 
-### 14.1 - Test 250 Sessions Monitoring Simultaneously
-**Status**: ✅ PASSED
+### 1. SessionHealthMonitor Enhancements
+**File**: `telegram_manager/health_monitor.py`
 
-**Test**: `test_250_sessions_monitoring_simultaneously`
+Added session failure tracking and recovery callbacks:
+- `failed_sessions`: Set to track sessions that have failed
+- `failure_callback`: Callback triggered when a session fails
+- `recovery_callback`: Callback triggered when a session recovers
 
-**What it validates**:
-- 250 sessions can start monitoring simultaneously without resource contention
-- All sessions successfully start monitoring
-- Operation completes in reasonable time (< 10 seconds)
-- Operation metrics are correctly tracked
-- No deadlocks or race conditions
+New methods:
+- `mark_session_as_failed()`: Marks a session as failed and triggers failure callback
+- `mark_session_as_recovered()`: Marks a session as recovered and triggers recovery callback
+- `is_session_failed()`: Checks if a session is marked as failed
+- `get_available_sessions()`: Returns list of non-failed session names
+- `get_failed_sessions()`: Returns list of failed session names
 
-**Results**:
-- ✅ All 250 sessions started monitoring successfully
-- ✅ Completed in < 1 second (excellent performance)
-- ✅ All operation metrics correctly tracked
+Updated methods:
+- `start_monitoring()`: Now accepts failure and recovery callbacks
+- `handle_disconnection()`: Now marks sessions as failed/recovered based on reconnection outcome
 
-**Requirements validated**: 2.1
+### 2. TelegramSessionManager Enhancements
+**File**: `telegram_manager/manager.py`
 
----
+Added operation queue and pending operations tracking:
+- `operation_queue`: OperationQueue for queuing operations when all sessions unavailable
+- `pending_operations`: Dict tracking pending operations per session
+- `queue_lock`: Lock for protecting queue operations
+- `pending_ops_lock`: Lock for protecting pending operations
 
-### 14.2 - Test Scraping While Monitoring
-**Status**: ✅ PASSED
+New methods:
+- `_handle_session_failure()`: Redistributes pending operations when a session fails
+- `_handle_session_recovery()`: Processes queued operations when a session recovers
+- `_process_queued_operations()`: Processes queued operations and assigns to available sessions
+- `start_health_monitoring()`: Starts health monitoring with failure/recovery callbacks
+- `stop_health_monitoring()`: Stops health monitoring
 
-**Test**: `test_scraping_while_monitoring`
+Updated methods:
+- `_get_available_session()`: Now excludes failed sessions from selection
+- `shutdown()`: Now stops health monitoring before shutdown
 
-**What it validates**:
-- Scraping operations can proceed while monitoring is active
-- Both operations run concurrently without blocking
-- Monitoring remains active during scraping
-- Operations complete in reasonable time
+### 3. Load Balancer Integration
+The load balancer now automatically excludes failed sessions because `_get_available_session()` filters sessions through the health monitor's `get_available_sessions()` method.
 
-**Results**:
-- ✅ 10 sessions monitoring simultaneously
-- ✅ 5 scraping operations completed while monitoring active
-- ✅ Monitoring remained active throughout
-- ✅ No blocking detected (completed in < 3 seconds)
+## Testing
 
-**Requirements validated**: 2.1, 2.4
+### Unit Tests
+Created comprehensive test suite in `tests/test_session_failure_recovery.py`:
 
----
+1. **test_mark_session_as_failed**: Verifies sessions can be marked as failed
+2. **test_mark_session_as_recovered**: Verifies sessions can be marked as recovered
+3. **test_failure_callback_triggered**: Verifies failure callback is called
+4. **test_recovery_callback_triggered**: Verifies recovery callback is called
+5. **test_handle_disconnection_marks_failed_on_reconnect_failure**: Verifies failed reconnection marks session as failed
+6. **test_handle_disconnection_marks_recovered_on_reconnect_success**: Verifies successful reconnection marks session as recovered
+7. **test_operation_queue_when_all_sessions_unavailable**: Verifies operations are queued when all sessions fail
+8. **test_operation_redistribution_to_available_sessions**: Verifies operations are redistributed to available sessions
+9. **test_operation_order_preserved_during_redistribution**: Verifies operation order is preserved
+10. **test_process_queued_operations_on_recovery**: Verifies queued operations are processed on recovery
+11. **test_failed_session_excluded_from_load_balancer**: Verifies failed sessions are not selected
+12. **test_recovered_session_included_in_load_balancer**: Verifies recovered sessions are selected
 
-### 14.3 - Test Concurrent Scraping with Limit
-**Status**: ✅ PASSED
+All tests pass successfully.
 
-**Test**: `test_concurrent_scraping_with_limit`
+### Updated Existing Tests
+Updated test fixtures in:
+- `tests/test_load_balancing.py`: Added health monitoring initialization
+- `tests/test_bulk_message_sending.py`: Added health monitoring initialization
 
-**What it validates**:
-- Maximum of 5 scrapes run concurrently (semaphore limit)
-- All 20 scraping requests complete successfully
-- Concurrency limit is properly enforced
-- Semaphore correctly queues and releases operations
+All existing tests continue to pass.
 
-**Results**:
-- ✅ Max concurrent scrapes: 5 (exactly as configured)
-- ✅ All 20 scrapes completed successfully
-- ✅ Total time: 0.80s (expected ~0.8s with 5 concurrent)
-- ✅ Semaphore working correctly
+## Key Features
 
-**Requirements validated**: 4.1, 4.2, 4.3
+### 1. Automatic Failure Detection
+The health monitor automatically detects session failures during periodic health checks and marks them as failed when reconnection attempts are exhausted.
 
----
+### 2. Operation Redistribution
+When a session fails, all pending operations are automatically redistributed to other available sessions, preserving operation order within priority levels.
 
-### 14.4 - Test Error Recovery (Locks Released)
-**Status**: ✅ PASSED
+### 3. Graceful Degradation
+When all sessions fail, operations are queued and automatically processed when sessions become available again.
 
-**Test**: `test_error_recovery_locks_released`
+### 4. Automatic Recovery
+When a failed session successfully reconnects, it is automatically reintegrated into the load balancer and can receive new operations.
 
-**What it validates**:
-- Errors in operations release all locks
-- Other sessions are unaffected by errors
-- Session load metrics are cleaned up
-- System continues operating after errors
+### 5. Order Preservation
+During redistribution, operations maintain their relative order within each priority level (HIGH, NORMAL, LOW).
 
-**Results**:
-- ✅ 4 operations succeeded, 1 failed (as expected)
-- ✅ All locks released after operations
-- ✅ Session load metrics reset to 0
-- ✅ Other sessions unaffected by error
+## Usage Example
 
-**Requirements validated**: 7.1, 7.2, 7.5
-
----
-
-### 14.4 - Test Error Recovery (With Retry)
-**Status**: ✅ PASSED
-
-**Test**: `test_error_recovery_with_retry`
-
-**What it validates**:
-- Retry logic works correctly for transient errors
-- Operations succeed after retries
-- Locks are released after successful retry
-- Errors don't cascade to other operations
-
-**Results**:
-- ✅ 3 attempts made (2 retries as configured)
-- ✅ Operation succeeded on 3rd attempt
-- ✅ Locks released after success
-- ✅ Retry logic working correctly
-
-**Requirements validated**: 7.1, 7.2
-
----
-
-### 14.5 - Test Graceful Shutdown
-**Status**: ✅ PASSED
-
-**Test**: `test_graceful_shutdown_with_active_operations`
-
-**What it validates**:
-- Shutdown cancels all active tasks
-- All resources are cleaned up
-- Shutdown completes within timeout
-- No resource leaks
-
-**Results**:
-- ✅ Shutdown completed in 0.01s (< 10s timeout)
-- ✅ All 10 sessions cleaned up
-- ✅ All resources released:
-  - Sessions cleared
-  - Session locks cleared
-  - Global tasks cleared
-  - Session load cleared
-  - Operation metrics reset
-  - Active scrape count reset
-
-**Requirements validated**: 5.4, 6.2
-
----
-
-## Key Implementation Details
-
-### Test Structure
-All tests use mock sessions to simulate realistic scenarios without requiring actual Telegram connections. The mocks properly simulate:
-- Asynchronous operations with realistic delays
-- Concurrent execution patterns
-- Error conditions
-- Resource tracking
-
-### Closure Handling
-Fixed Python closure issues by using factory functions to capture correct mock session references:
 ```python
-def make_start_monitoring(session):
-    async def mock_start_monitoring(targets):
-        session.is_monitoring = True
-        return True
-    return mock_start_monitoring
+# Initialize manager
+manager = TelegramSessionManager()
 
-mock_session.start_monitoring = make_start_monitoring(mock_session)
+# Load sessions
+await manager.load_sessions_from_db()
+
+# Start health monitoring with automatic failure recovery
+await manager.start_health_monitoring()
+
+# Operations will automatically handle session failures
+results = await manager.send_text_messages_bulk(
+    recipients=['user1', 'user2', 'user3'],
+    message='Hello!'
+)
+
+# Cleanup
+await manager.shutdown()
 ```
 
-### Concurrency Tracking
-Tests track concurrent operation counts to verify semaphore limits:
-```python
-max_concurrent = 0
-current_concurrent = 0
-concurrent_lock = asyncio.Lock()
+## Benefits
 
-# Track in mock operations
-async with concurrent_lock:
-    current_concurrent += 1
-    if current_concurrent > max_concurrent:
-        max_concurrent = current_concurrent
-```
+1. **Resilience**: System continues operating even when individual sessions fail
+2. **No Data Loss**: Operations are redistributed or queued, never lost
+3. **Automatic Recovery**: No manual intervention needed when sessions recover
+4. **Load Balancing**: Failed sessions are excluded from load balancing automatically
+5. **Order Preservation**: Critical for maintaining operation semantics
 
-## Performance Metrics
+## Compliance
 
-| Test | Sessions | Operations | Time | Status |
-|------|----------|------------|------|--------|
-| 250 Sessions Monitoring | 250 | 250 | < 1s | ✅ |
-| Scraping While Monitoring | 10 | 5 scrapes | < 3s | ✅ |
-| Concurrent Scraping Limit | 10 | 20 scrapes | 0.80s | ✅ |
-| Error Recovery | 5 | 5 scrapes | < 1s | ✅ |
-| Graceful Shutdown | 10 | 5 scrapes | 0.01s | ✅ |
-
-## Validation Summary
-
-✅ **All integration tests passing**
-- 6/6 tests passed
-- All requirements validated
-- No resource leaks detected
-- No deadlocks or race conditions
-- Proper error handling and recovery
-- Clean shutdown and resource cleanup
-
-## Requirements Coverage
-
-| Requirement | Test Coverage | Status |
-|-------------|---------------|--------|
-| 2.1 - Monitoring without blocking | 14.1, 14.2 | ✅ |
-| 2.4 - Monitoring and scraping concurrent | 14.2 | ✅ |
-| 4.1 - Scrape concurrency limit | 14.3 | ✅ |
-| 4.2 - Scrape queuing | 14.3 | ✅ |
-| 4.3 - Scrape completion releases slot | 14.3 | ✅ |
-| 5.4 - Shutdown cancels all tasks | 14.5 | ✅ |
-| 6.2 - Task cancellation timeout | 14.5 | ✅ |
-| 7.1 - Lock release on error | 14.4 | ✅ |
-| 7.2 - Error isolation | 14.4 | ✅ |
-| 7.5 - Other sessions unaffected | 14.4 | ✅ |
-
-## Conclusion
-
-The integration tests comprehensively validate that the concurrency fixes work correctly under realistic load conditions. The system successfully handles:
-
-1. **Massive scale**: 250 concurrent monitoring sessions
-2. **Mixed workloads**: Monitoring and scraping simultaneously
-3. **Resource limits**: Proper enforcement of concurrency limits
-4. **Error resilience**: Graceful error handling and recovery
-5. **Clean shutdown**: Proper resource cleanup
-
-All tests pass, demonstrating that the implementation meets all requirements and handles edge cases correctly.
+✅ All requirements (23.1, 23.2, 23.3, 23.4, 23.5) fully implemented
+✅ All unit tests passing (12/12)
+✅ Existing tests updated and passing
+✅ No breaking changes to existing functionality
+✅ Comprehensive error handling and logging

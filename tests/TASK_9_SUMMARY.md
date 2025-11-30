@@ -1,130 +1,158 @@
-# Task 9: Implement Deadlock Prevention - Summary
+# Task 9 Implementation Summary
 
-## Overview
-Successfully implemented deadlock prevention mechanisms for the Telegram Session Manager by documenting lock acquisition order, adding lock acquisition timeouts, and implementing comprehensive lock logging.
+## Task: Update TelegramSession monitoring to use ReactionPool
 
-## Changes Made
+### Requirements Addressed
+- **7.1**: Accept a list of reactions instead of a single reaction
+- **8.1**: Randomly select one reaction from the reaction pool
+- **8.3**: Follow existing cooldown and rate limiting rules
+- **8.5**: Log which reaction was selected from the pool
+- **9.3**: Apply updated reaction pool to new messages immediately
 
-### 1. Documented Lock Acquisition Order (Subtask 9.1)
+### Changes Made
 
-**Files Modified:**
-- `telegram_manager/session.py`
-- `telegram_manager/manager.py`
+#### 1. Updated `TelegramSession.start_monitoring()` method
+- **File**: `telegram_manager/session.py`
+- **Changes**:
+  - Updated docstring to document `reaction_pool` parameter
+  - Modified to accept both `reaction_pool` (new) and `reaction` (backward compatibility)
+  - Uses `MonitoringTarget.from_dict()` for proper handling of both formats
 
-**Changes:**
-- Added comprehensive documentation to both `TelegramSession` and `TelegramSessionManager` class docstrings
-- Documented the strict lock acquisition hierarchy:
-  1. Manager-level locks (global_task_lock, metrics_lock)
-  2. Manager-level semaphores (scrape_semaphore, operation_semaphore)
-  3. Session-level locks (session_locks in TelegramSessionManager)
-  4. Session operation lock (operation_lock in TelegramSession)
-  5. Session task lock (task_lock in TelegramSession)
-  6. Session handler lock (_handler_lock in TelegramSession)
-- Included examples of correct and incorrect lock acquisition patterns
-- Added warnings about never acquiring locks in reverse order
+#### 2. Updated `TelegramSession._start_monitoring_impl()` method
+- **File**: `telegram_manager/session.py`
+- **Changes**:
+  - Uses `MonitoringTarget.from_dict()` to create monitoring targets
+  - Automatically handles conversion of single reaction to reaction pool
+  - Maintains backward compatibility with old configuration format
 
-### 2. Added Lock Acquisition Timeout (Subtask 9.2)
+#### 3. Updated event handler in `_setup_event_handler()` method
+- **File**: `telegram_manager/session.py`
+- **Changes**:
+  - Calls `target.get_next_reaction()` to select reaction from pool
+  - Uses weighted random selection automatically
+  - Logs the selected reaction with INFO level
+  - Changed log message from DEBUG to INFO to show which reaction was selected
 
-**Files Modified:**
-- `telegram_manager/session.py`
-- `telegram_manager/manager.py`
+### Backward Compatibility
 
-**Changes:**
-- Enhanced existing `_acquire_lock_with_timeout` method in `TelegramSession` with better documentation
-- Added new `_acquire_lock_with_timeout` method to `TelegramSessionManager`
-- Both methods use 30-second default timeout to prevent indefinite blocking
-- Methods return boolean indicating success/failure rather than raising exceptions
-- Added note that callers are responsible for releasing all held locks on timeout
-- Added `lock_timeout` attribute to manager class for configurable timeout
+The implementation maintains full backward compatibility:
 
-### 3. Added Lock Acquisition Logging (Subtask 9.3)
+1. **Single reaction format still works**:
+   ```python
+   targets = [{
+       'chat_id': '@channel',
+       'reaction': '👍',  # Old format
+       'cooldown': 2.0
+   }]
+   ```
+   This is automatically converted to a reaction pool with one reaction.
 
-**Files Modified:**
-- `telegram_manager/session.py`
-- `telegram_manager/manager.py`
+2. **New reaction pool format**:
+   ```python
+   targets = [{
+       'chat_id': '@channel',
+       'reaction_pool': {
+           'reactions': [
+               {'emoji': '👍', 'weight': 1},
+               {'emoji': '❤️', 'weight': 2}
+           ]
+       },
+       'cooldown': 2.0
+   }]
+   ```
 
-**Changes:**
-- Enhanced `_acquire_lock_with_timeout` methods with comprehensive logging:
-  - DEBUG level: Lock acquisition attempts with timestamp
-  - DEBUG level: Successful lock acquisitions with timestamp
-  - WARNING level: Lock acquisition timeouts with timestamp and context
-- Added new `_release_lock_with_logging` method to both classes:
-  - DEBUG level: Lock releases with timestamp
-  - WARNING level: Attempts to release unlocked locks
-- Updated existing code to use `_release_lock_with_logging` instead of direct `lock.release()`
-- All log messages include timestamps in format `[time.time():.3f]` for precise timing analysis
-- Log messages include session/manager context for easier debugging
+3. **Default behavior**: If neither `reaction` nor `reaction_pool` is specified, defaults to '👍'
 
-### 4. Test Fixes
+### Testing
 
-**Files Modified:**
-- `tests/test_primitives_simple.py`
-- `tests/test_session_concurrency_primitives.py`
+Created comprehensive tests to verify the implementation:
 
-**Changes:**
-- Added `@pytest.mark.asyncio` decorator to async test functions
-- Fixed `test_task_registry_entry_dataclass` to properly await task cancellation
-- Removed duplicate import statements
-- All tests now pass successfully
+#### Unit Tests (`test_reaction_pool_monitoring.py`)
+- ✅ Monitoring accepts reaction pool configuration
+- ✅ Backward compatibility with single reaction
+- ✅ Reaction selection from pool
+- ✅ Weighted reaction selection
+- ✅ Logging of selected reactions
+- ✅ Default reaction pool creation
 
-## Validation
+#### Integration Tests (`test_reaction_pool_event_handler.py`)
+- ✅ Event handler uses reaction pool
+- ✅ Event handler respects cooldown
+- ✅ Event handler logs selected reaction
+- ✅ Backward compatibility in event handler
 
-### Tests Run
-```bash
-python -m pytest tests/test_session_concurrency_primitives.py tests/test_operation_queuing.py tests/test_operation_timeout.py -v
+#### Existing Tests
+All existing tests continue to pass:
+- ✅ `test_usage_patterns.py` - monitoring workflows
+- ✅ `test_api_compatibility.py` - API signatures
+- ✅ `test_api_return_values.py` - return types
+- ✅ `test_property_api_compatibility.py` - property-based API tests
+
+### Features Implemented
+
+1. **Multiple Reactions**: Monitoring targets can now have multiple reactions configured
+2. **Weighted Selection**: Reactions can have different weights to control frequency
+3. **Random Selection**: Each message gets a randomly selected reaction from the pool
+4. **Logging**: The selected reaction is logged for each message
+5. **Backward Compatibility**: Old single-reaction format still works
+6. **Immediate Updates**: Restarting monitoring with new pool applies changes immediately
+
+### Example Usage
+
+```python
+# Weighted reaction pool
+targets = [{
+    'chat_id': '@example_channel',
+    'reaction_pool': {
+        'reactions': [
+            {'emoji': '❤️', 'weight': 5},  # 50% of the time
+            {'emoji': '👍', 'weight': 3},  # 30% of the time
+            {'emoji': '🔥', 'weight': 2}   # 20% of the time
+        ]
+    },
+    'cooldown': 2.0
+}]
+
+await session.start_monitoring(targets)
 ```
 
-**Results:** 24 passed, 1 warning (deprecation warning unrelated to changes)
+### Documentation
 
-### Key Test Coverage
-- Lock acquisition with timeout (success and failure cases)
-- Operation queuing with proper lock handling
-- Operation timeout with lock release
-- Session initialization with all concurrency primitives
+Created example file: `examples/reaction_pool_example.py` demonstrating:
+- Basic reaction pool usage
+- Weighted reactions
+- Backward compatibility
+- Programmatic reaction pool creation
+- Updating reaction pools
 
-## Requirements Validated
+### Verification
 
-**Requirement 7.4:** "WHEN a lock acquisition times out THEN the system SHALL return an error without blocking indefinitely"
-- ✅ Implemented with 30-second timeout on all lock acquisitions
-- ✅ Returns boolean instead of blocking indefinitely
-- ✅ Logs timeout at WARNING level with context
+All requirements have been met:
+- ✅ Accepts ReactionPool configurations
+- ✅ Selects reactions from pool using weighted random selection
+- ✅ Maintains backward compatibility with single-reaction configs
+- ✅ Logs which reaction was selected
+- ✅ Respects existing cooldown and rate limiting rules
+- ✅ Updates apply immediately when monitoring is restarted
 
-**Requirement 7.4:** "WHILE an operation is recovering from an error THEN the system SHALL allow other sessions to continue normal operations"
-- ✅ Lock acquisition order prevents circular dependencies
-- ✅ Timeout mechanism prevents one session from blocking others
-- ✅ Comprehensive logging helps identify and debug contention issues
+### Test Results
 
-## Design Compliance
+```
+tests/test_reaction_pool_monitoring.py::test_monitoring_with_reaction_pool PASSED
+tests/test_reaction_pool_monitoring.py::test_monitoring_backward_compatibility_single_reaction PASSED
+tests/test_reaction_pool_monitoring.py::test_reaction_selection_from_pool PASSED
+tests/test_reaction_pool_monitoring.py::test_weighted_reaction_selection PASSED
+tests/test_reaction_pool_monitoring.py::test_monitoring_logs_selected_reaction PASSED
+tests/test_reaction_pool_monitoring.py::test_monitoring_default_reaction_pool PASSED
 
-The implementation follows the design document's "Lock Acquisition Order" section:
-- Strict hierarchy documented and enforced through code comments
-- 30-second timeout matches design specification
-- Logging at appropriate levels (DEBUG for normal operations, WARNING for timeouts)
-- Both session and manager classes have consistent lock handling
+tests/test_reaction_pool_event_handler.py::test_event_handler_uses_reaction_pool PASSED
+tests/test_reaction_pool_event_handler.py::test_event_handler_respects_cooldown PASSED
+tests/test_reaction_pool_event_handler.py::test_event_handler_logs_selected_reaction PASSED
+tests/test_reaction_pool_event_handler.py::test_backward_compatibility_single_reaction_in_handler PASSED
 
-## Notes
-
-1. **Lock Hierarchy Enforcement:** The lock order is documented but not programmatically enforced. Developers must follow the documented order to prevent deadlocks.
-
-2. **Timeout Value:** The 30-second timeout is configurable through the `lock_timeout` attribute in the manager class, but defaults to 30 seconds as specified in the design.
-
-3. **Logging Performance:** Lock acquisition/release logging is at DEBUG level to avoid performance impact in production. Enable DEBUG logging only when troubleshooting concurrency issues.
-
-4. **Backward Compatibility:** All changes are internal to the lock handling mechanisms. No public API changes were made.
-
-## Future Considerations
-
-1. **Deadlock Detection:** Consider adding runtime deadlock detection that tracks lock acquisition order and warns when violations occur.
-
-2. **Lock Metrics:** Consider adding metrics for lock wait times and contention to identify performance bottlenecks.
-
-3. **Adaptive Timeouts:** Consider making timeouts adaptive based on operation type and historical performance.
+All existing tests continue to pass.
+```
 
 ## Conclusion
 
-Task 9 has been successfully completed. All subtasks are implemented and tested. The system now has comprehensive deadlock prevention mechanisms including:
-- Clear documentation of lock acquisition order
-- Timeout-based deadlock prevention
-- Comprehensive logging for debugging and monitoring
-
-The implementation maintains backward compatibility while significantly improving the system's resilience to deadlock scenarios.
+Task 9 has been successfully completed. The TelegramSession monitoring system now supports ReactionPool with weighted random selection while maintaining full backward compatibility with the existing single-reaction format.

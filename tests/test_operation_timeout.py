@@ -60,8 +60,8 @@ async def test_execute_with_timeout_uses_correct_timeout():
     
     # We can't easily test the actual timeout value without mocking,
     # but we can verify the method uses _get_operation_timeout
+    # Note: monitoring is no longer part of the operation queue system
     assert session._get_operation_timeout('scraping') == 300.0
-    assert session._get_operation_timeout('monitoring') == 3600.0
     assert session._get_operation_timeout('sending') == 60.0
 
 
@@ -136,7 +136,7 @@ async def test_sending_operation_has_timeout():
 
 @pytest.mark.asyncio
 async def test_monitoring_operation_has_timeout():
-    """Test that monitoring operations use timeout wrapper"""
+    """Test that monitoring operations start independently (no longer use operation queue)"""
     session = TelegramSession("test_session", 12345, "test_hash")
     session.is_connected = True
     
@@ -152,7 +152,7 @@ async def test_monitoring_operation_has_timeout():
     # Replace the implementation
     session._start_monitoring_impl = mock_monitoring_impl
     
-    # Call the public method
+    # Call the public method - monitoring now runs independently
     result = await session.start_monitoring([{'chat_id': 'test', 'reaction': '👍'}])
     
     # Verify the implementation was called
