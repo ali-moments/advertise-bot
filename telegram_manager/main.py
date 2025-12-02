@@ -713,7 +713,7 @@ class TelegramManagerApp:
         self,
         chat_id: str,
         reactions: List[Dict[str, any]],
-        cooldown: float = 2.0
+        cooldown: float = 1.0
     ) -> Dict[str, any]:
         """
         Configure a reaction pool for a monitoring target
@@ -722,7 +722,7 @@ class TelegramManagerApp:
             chat_id: Chat identifier to configure
             reactions: List of reaction configs with 'emoji' and optional 'weight' keys
                       Example: [{'emoji': '👍', 'weight': 2}, {'emoji': '❤️', 'weight': 1}]
-            cooldown: Cooldown period between reactions (seconds, default 2.0)
+            cooldown: Cooldown period between reactions (seconds, default 1.0)
             
         Returns:
             Dict with 'success' status and 'message' or 'error'
@@ -893,7 +893,7 @@ class TelegramManagerApp:
             
             # Get existing target to preserve other settings
             existing_target = self.monitoring_targets[target_index]
-            cooldown = existing_target.get('cooldown', 2.0) if isinstance(existing_target, dict) else existing_target.cooldown
+            cooldown = existing_target.get('cooldown', 1.0) if isinstance(existing_target, dict) else existing_target.cooldown
             
             # Create updated monitoring target
             from .config import MonitoringTarget
@@ -969,13 +969,13 @@ class TelegramManagerApp:
                     if 'reaction_pool' in target:
                         result[chat_id] = {
                             'reactions': target['reaction_pool']['reactions'],
-                            'cooldown': target.get('cooldown', 2.0)
+                            'cooldown': target.get('cooldown', 1.0)
                         }
                     elif 'reaction' in target:
                         # Single reaction - display as single-item pool
                         result[chat_id] = {
                             'reactions': [{'emoji': target['reaction'], 'weight': 1}],
-                            'cooldown': target.get('cooldown', 2.0)
+                            'cooldown': target.get('cooldown', 1.0)
                         }
                 else:
                     # MonitoringTarget object
@@ -1072,7 +1072,7 @@ class TelegramManagerApp:
                     )
                     
                     # Get cooldown
-                    cooldown = target.get('cooldown', 2.0) if isinstance(target, dict) else target.cooldown
+                    cooldown = target.get('cooldown', 1.0) if isinstance(target, dict) else target.cooldown
                     
                     # Create updated monitoring target
                     updated_target = MonitoringTarget(

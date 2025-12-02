@@ -8,6 +8,7 @@ import time
 import asyncio
 import logging
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Set, Callable, Any
@@ -17,7 +18,7 @@ from telethon.tl.types import Channel, Chat
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import Message, MessageReactions, MessageActionChatAddUser
+from telethon.tl.types import Message, MessageReactions, MessageActionChatAddUser, ReactionEmoji
 
 from .config import MonitoringTarget
 from .constants import (
@@ -26,6 +27,15 @@ from .constants import (
     MONITORING_COOLDOWN,
     MESSAGE_SCRAPING_DAYS
 )
+
+
+@dataclass
+class PendingReaction:
+    """Represents a pending reaction in the queue"""
+    chat_identifier: str
+    message_id: int
+    reaction: str
+    queued_at: float
 
 
 @dataclass
@@ -154,6 +164,10 @@ class TelegramSession:
         self.is_monitoring = False
         self._event_handler = None
         self._handler_error_count = 0  # Track error count per session
+        
+        # Reaction queue system (Requirements 4.1, 4.2, 4.3)
+        self.reaction_queue: deque = deque(maxlen=100)  # Max 100 pending reactions
+        self.reaction_processor_task: Optional[asyncio.Task] = None
         
         # Task management
         self.active_tasks: Set[asyncio.Task] = set()
@@ -789,8 +803,44 @@ class TelegramSession:
             >>> await session.start_monitoring(targets)
             True
         """
+        # Log monitoring start attempt with target details (Requirements 1.1, 5.1)
+        target_list = [t.get('chat_id', 'unknown') for t in targets]
+        self.logger.info(
+            f"[MONITOR] 🎯 Starting monitoring for {len(targets)} targets",
+            extra={
+                'target_count': len(targets),
+                'targets': target_list,
+                'session': str(self.session_file)
+            }
+        )
+        
         # Call implementation directly without queuing (AC-1.1, AC-1.2, AC-5.2)
-        return await self._start_monitoring_impl(targets)
+        result = await self._start_monitoring_impl(targets)
+        
+        # Log monitoring status after start attempt (Requirements 1.1, 1.2, 1.3)
+        if result:
+            self.logger.info(
+                f"[MONITOR] ✅ Monitoring started successfully",
+                extra={
+                    'is_monitoring': self.is_monitoring,
+                    'target_count': len(self.monitoring_targets),
+                    'active_targets': list(self.monitoring_targets.keys()),
+                    'session': str(self.session_file)
+                }
+            )
+        else:
+            # Error logging when monitoring fails to start (Requirement 1.3)
+            self.logger.error(
+                f"[MONITOR] ❌ Failed to start monitoring",
+                extra={
+                    'is_monitoring': self.is_monitoring,
+                    'target_count': len(self.monitoring_targets),
+                    'requested_targets': target_list,
+                    'session': str(self.session_file)
+                }
+            )
+        
+        return result
 
     async def _start_monitoring_impl(self, targets: List[Dict]) -> bool:
         """
@@ -804,17 +854,109 @@ class TelegramSession:
             bool: True if monitoring started successfully
         """
         if self.is_monitoring:
+            self.logger.info("[MONITOR] 🔄 Stopping existing monitoring before starting new session")
             await self.stop_monitoring()
 
         try:
-            # Setup monitoring targets
+            # Verify/ensure membership for all targets before monitoring (Requirements 2.4, 2.5)
+            successfully_joined_targets = []
+            
+            # Log detailed target configuration (Requirement 5.1)
             for target in targets:
-                # Use MonitoringTarget.from_dict for proper handling of reaction_pool
+                channel_id = target['chat_id']
+                cooldown = target.get('cooldown', 1.0)
+                reaction_info = target.get('reaction_pool', target.get('reaction', 'unknown'))
+                
+                self.logger.debug(
+                    f"[MONITOR] 📋 Processing target: {channel_id}",
+                    extra={
+                        'chat_id': channel_id,
+                        'cooldown': cooldown,
+                        'reaction_config': str(reaction_info)[:100]  # Truncate for logging
+                    }
+                )
+                
+                # Check if session is already a member (Requirement 2.4)
+                is_member = await self.is_channel_member(channel_id)
+                
+                if not is_member:
+                    # Auto-join channel if not a member (Requirement 2.5)
+                    self.logger.info(f"[MONITOR] 🔄 Not a member of {channel_id}, attempting to join...")
+                    success, error = await self.join_channel_with_retry(channel_id)
+                    
+                    if not success:
+                        # Log warning for channels that couldn't be joined (Requirement 1.3)
+                        self.logger.warning(
+                            f"[MONITOR] ⚠️ Cannot monitor {channel_id}: {error}. "
+                            f"Skipping this channel.",
+                            extra={
+                                'chat_id': channel_id,
+                                'error': str(error),
+                                'reason': 'join_failed'
+                            }
+                        )
+                        continue  # Skip this target
+                    
+                    self.logger.info(f"[MONITOR] ✅ Successfully joined {channel_id}")
+                else:
+                    self.logger.debug(f"[MONITOR] ✅ Already a member of {channel_id}")
+                
+                # Only add to monitoring targets if join successful (or already a member)
                 monitoring_target = MonitoringTarget.from_dict(target)
-                self.monitoring_targets[target['chat_id']] = monitoring_target
+                self.monitoring_targets[channel_id] = monitoring_target
+                successfully_joined_targets.append(channel_id)
+                
+                # Log successful target addition (Requirement 5.1)
+                self.logger.info(
+                    f"[MONITOR] ✅ Added target: {channel_id}",
+                    extra={
+                        'chat_id': channel_id,
+                        'cooldown': monitoring_target.cooldown,
+                        'reaction_pool_size': len(monitoring_target.reaction_pool.reactions) if monitoring_target.reaction_pool else 1
+                    }
+                )
+
+            # Check if we have any targets to monitor
+            if not successfully_joined_targets:
+                self.logger.error(
+                    "[MONITOR] ❌ No channels available for monitoring (all join attempts failed)",
+                    extra={
+                        'requested_count': len(targets),
+                        'successful_count': 0,
+                        'session': str(self.session_file)
+                    }
+                )
+                return False
+
+            # Log cooldown configuration when monitoring starts (Requirement 5.4, Task 8)
+            cooldown_configs = {
+                chat_id: {
+                    'cooldown': target.cooldown,
+                    'reaction_pool_size': len(target.reaction_pool.reactions) if target.reaction_pool else 1
+                }
+                for chat_id, target in self.monitoring_targets.items()
+            }
+            self.logger.info(
+                f"[MONITOR] ⚙️ Cooldown configuration for {len(self.monitoring_targets)} targets",
+                extra={
+                    'cooldown_configs': cooldown_configs,
+                    'session': str(self.session_file)
+                }
+            )
 
             # Setup event handler (now async)
+            self.logger.debug("[MONITOR] 🔧 Setting up event handler...")
             await self._setup_event_handler()
+            self.logger.debug("[MONITOR] ✅ Event handler setup complete")
+            
+            # Start reaction processor task (Requirement 4.2)
+            self.logger.debug("[MONITOR] 🔧 Starting reaction processor task...")
+            self.reaction_processor_task = self._create_task(
+                self._process_reaction_queue(),
+                task_type="reaction_processor",
+                parent_operation="monitoring"
+            )
+            self.logger.debug("[MONITOR] ✅ Reaction processor task started")
             
             # Create monitoring task to track the monitoring operation
             # The event handler itself runs in the background, but we track it as a monitoring task
@@ -834,44 +976,128 @@ class TelegramSession:
             )
             
             self.is_monitoring = True
-            self.logger.info(f"[MONITOR] 🎯 Started monitoring {len(targets)} targets")
+            
+            # Log detailed monitoring start summary (Requirements 1.1, 5.1)
+            self.logger.info(
+                f"[MONITOR] 🎯 Monitoring active for {len(successfully_joined_targets)} targets "
+                f"(skipped {len(targets) - len(successfully_joined_targets)} due to join failures)",
+                extra={
+                    'is_monitoring': self.is_monitoring,
+                    'target_count': len(successfully_joined_targets),
+                    'active_targets': successfully_joined_targets,
+                    'skipped_count': len(targets) - len(successfully_joined_targets),
+                    'session': str(self.session_file)
+                }
+            )
             return True
             
         except Exception as e:
-            self.logger.error(f"[MONITOR] ❌ Failed to start monitoring: {e}")
+            # Enhanced error logging with context (Requirements 1.3, 5.5)
+            self.logger.error(
+                f"[MONITOR] ❌ Failed to start monitoring: {e}",
+                extra={
+                    'error': str(e),
+                    'error_type': type(e).__name__,
+                    'is_monitoring': self.is_monitoring,
+                    'target_count': len(self.monitoring_targets),
+                    'session': str(self.session_file)
+                },
+                exc_info=True
+            )
             return False
 
     async def stop_monitoring(self):
         """Stop monitoring and cleanup event handlers"""
         # Acquire handler lock to ensure only one handler setup/teardown at a time
         async with self._handler_lock:
+            # Store target info before clearing for logging
+            target_count = len(self.monitoring_targets)
+            target_list = list(self.monitoring_targets.keys())
+            
+            # Log monitoring stop attempt (Requirement 1.4)
+            if not self.is_monitoring and not self.monitoring_task:
+                self.logger.debug("[MONITOR] 🔕 Monitoring already stopped, nothing to do")
+                return
+            
+            if self.is_monitoring:
+                self.logger.info(
+                    f"[MONITOR] 🛑 Stopping monitoring for {target_count} targets",
+                    extra={
+                        'target_count': target_count,
+                        'targets': target_list,
+                        'session': str(self.session_file)
+                    }
+                )
+            
             # Cancel monitoring task if it exists
             if self.monitoring_task and not self.monitoring_task.done():
+                self.logger.debug("[MONITOR] 🔄 Cancelling monitoring keepalive task...")
                 self.monitoring_task.cancel()
                 try:
                     await asyncio.wait_for(self.monitoring_task, timeout=5.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     self.logger.debug("[MONITOR] Monitoring task cancelled")
+            
+            # Always set monitoring_task to None after cancellation attempt
+            if self.monitoring_task:
                 self.monitoring_task = None
+            
+            # Stop and cleanup reaction processor task (Requirement 4.4)
+            if self.reaction_processor_task and not self.reaction_processor_task.done():
+                self.logger.debug("[MONITOR] 🔄 Cancelling reaction processor task...")
+                self.reaction_processor_task.cancel()
+                try:
+                    await asyncio.wait_for(self.reaction_processor_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    self.logger.debug("[MONITOR] Reaction processor task cancelled")
+            
+            # Always set reaction_processor_task to None after cancellation attempt
+            if self.reaction_processor_task:
+                self.reaction_processor_task = None
+            
+            # Clear reaction queue (Requirement 4.4)
+            if self.reaction_queue:
+                queue_size = len(self.reaction_queue)
+                if queue_size > 0:
+                    self.logger.debug(f"[MONITOR] 🗑️ Clearing {queue_size} pending reactions from queue")
+                self.reaction_queue.clear()
             
             # Remove event handler
             if self._event_handler and self.client:
+                self.logger.debug("[MONITOR] 🔄 Removing event handler...")
                 self.client.remove_event_handler(self._event_handler)
                 self._event_handler = None
+                self.logger.debug("[MONITOR] ✅ Event handler removed")
             
             self.monitoring_targets.clear()
             self.is_monitoring = False
-            self.logger.info("[MONITOR] 🛑 Stopped monitoring")
+            
+            # Log monitoring stopped with final status (Requirements 1.4, 5.1)
+            if target_count > 0 or self.is_monitoring:
+                self.logger.info(
+                    "[MONITOR] ✅ Monitoring stopped successfully",
+                    extra={
+                        'is_monitoring': self.is_monitoring,
+                        'target_count': 0,
+                        'previous_target_count': target_count,
+                        'session': str(self.session_file)
+                    }
+                )
 
     async def _setup_event_handler(self):
         """Setup isolated event handler for this session"""
         if not self.client:
+            self.logger.error(
+                "[MONITOR] ❌ Cannot setup event handler: client not initialized",
+                extra={'session': str(self.session_file)}
+            )
             return
 
         # Acquire handler lock to ensure only one handler setup/teardown at a time
         async with self._handler_lock:
             # Remove existing handler if present
             if self._event_handler:
+                self.logger.debug("[MONITOR] 🔄 Removing existing event handler before setup")
                 self.client.remove_event_handler(self._event_handler)
                 self._event_handler = None
 
@@ -879,53 +1105,197 @@ class TelegramSession:
             if not hasattr(self, '_handler_error_count'):
                 self._handler_error_count = 0
 
-            @self.client.on(events.NewMessage)
-            async def message_handler(event):
-                # Skip our own messages
-                if event.out:
-                    return
-                    
-                try:
-                    chat = await event.get_chat()
-                    chat_identifier = self._get_chat_identifier(chat)
-                    
-                    # Check if we're monitoring this chat
-                    target = self.monitoring_targets.get(chat_identifier)
-                    if not target:
+            try:
+                @self.client.on(events.NewMessage)
+                async def message_handler(event):
+                    # Skip our own messages
+                    if event.out:
                         return
                     
-                    # Rate limiting check
-                    current_time = time.time()
-                    if current_time - target.last_reaction_time < target.cooldown:
-                        return
+                    # Log that event handler was triggered (Requirements 3.5, 5.2)
+                    self.logger.info(
+                        f"[MONITOR] 📨 New message event triggered",
+                        extra={
+                            'chat_id': event.chat_id,
+                            'message_id': event.message.id,
+                            'is_out': event.out,
+                            'session': str(self.session_file)
+                        }
+                    )
+                        
+                    chat_identifier = None
+                    target = None
                     
-                    # Select reaction from pool using weighted random selection
-                    selected_reaction = target.get_next_reaction()
-                    
-                    # React to the message
-                    success = await self._safe_react_to_message(chat, event.message.id, selected_reaction)
-                    if success:
-                        target.last_reaction_time = current_time
-                        # Log which reaction was selected from the pool with structured logging (Requirement 8.5)
+                    try:
+                        chat = await event.get_chat()
+                        chat_identifier = self._get_chat_identifier(chat)
+                        
+                        # Log chat identifier for debugging
                         self.logger.info(
-                            f"[MONITOR] 🔔 Reacted to new message in {chat_identifier} with {selected_reaction}",
+                            f"[MONITOR] 🔍 Message from chat: {chat_identifier}",
                             extra={
-                                'operation_type': 'reaction',
                                 'chat_identifier': chat_identifier,
-                                'selected_reaction': selected_reaction,
-                                'reaction_pool_size': len(target.reaction_pool.reactions) if target.reaction_pool else 1,
-                                'message_id': event.message.id,
-                                'cooldown': target.cooldown
+                                'monitored_targets': list(self.monitoring_targets.keys()),
+                                'session': str(self.session_file)
                             }
                         )
-                    
-                except Exception as e:
-                    # Track error count per session
-                    self._handler_error_count += 1
-                    # Log errors without crashing event loop
-                    self.logger.error(f"[MONITOR] ❌ Error in message handler (count: {self._handler_error_count}): {e}")
+                        
+                        # Check if we're monitoring this chat
+                        target = self.monitoring_targets.get(chat_identifier)
+                        if not target:
+                            # Only log at debug level to avoid spam from non-monitored chats
+                            return
+                        
+                        # Increment messages processed (Requirement 4.3)
+                        target.messages_processed += 1
+                        
+                        # Select reaction from pool using weighted random selection
+                        selected_reaction = target.get_next_reaction()
+                        
+                        # Check cooldown before sending reaction (Requirements 2.3, 2.4)
+                        current_time = time.time()
+                        time_since_last = current_time - target.last_reaction_time
+                        
+                        if time_since_last >= target.cooldown:
+                            # Add small random delay (0-2 seconds) to prevent all sessions from reacting simultaneously
+                            # This helps avoid Telegram flood wait errors when multiple sessions monitor the same channel
+                            import random
+                            delay = random.uniform(0, 2.0)
+                            await asyncio.sleep(delay)
+                            
+                            # Send reaction immediately if cooldown has passed (Requirement 2.3)
+                            try:
+                                success = await self._safe_react_to_message(chat, event.message.id, selected_reaction)
+                                if success:
+                                    target.last_reaction_time = current_time
+                                    target.reactions_sent += 1  # Update target statistics (Requirement 5.3)
+                                    # Log immediate reactions with structured fields (Requirements 5.3, Task 8)
+                                    self.logger.info(
+                                        f"[MONITOR] 🔔 Reacted immediately to message in {chat_identifier} (cooldown satisfied)",
+                                        extra={
+                                            'operation_type': 'reaction_immediate',
+                                            'chat_identifier': chat_identifier,
+                                            'selected_reaction': selected_reaction,
+                                            'reaction_pool_size': len(target.reaction_pool.reactions) if target.reaction_pool else 1,
+                                            'message_id': event.message.id,
+                                            'cooldown': target.cooldown,
+                                            'time_since_last': time_since_last,
+                                            'reactions_sent': target.reactions_sent,
+                                            'messages_processed': target.messages_processed,
+                                            'queue_size': len(self.reaction_queue),
+                                            'session': str(self.session_file)
+                                        }
+                                    )
+                                else:
+                                    # Track reaction failure (Requirement 3.5)
+                                    target.reaction_failures += 1
+                                    # Add structured logging for failures (Task 8)
+                                    self.logger.warning(
+                                        f"[MONITOR] ⚠️ Failed to react to message in {chat_identifier} (failures: {target.reaction_failures})",
+                                        extra={
+                                            'operation_type': 'reaction_failed',
+                                            'chat_identifier': chat_identifier,
+                                            'message_id': event.message.id,
+                                            'reaction': selected_reaction,
+                                            'reaction_failures': target.reaction_failures,
+                                            'reactions_sent': target.reactions_sent,
+                                            'messages_processed': target.messages_processed,
+                                            'cooldown': target.cooldown,
+                                            'session': str(self.session_file)
+                                        }
+                                    )
+                            except Exception as reaction_error:
+                                # Log reaction failure without stopping monitoring (Requirement 3.5)
+                                target.reaction_failures += 1
+                                self._handler_error_count += 1
+                                # Add structured logging for errors (Task 8)
+                                self.logger.error(
+                                    f"[MONITOR] ❌ Reaction send error in {chat_identifier}: {reaction_error} "
+                                    f"(session errors: {self._handler_error_count}, reaction failures: {target.reaction_failures})",
+                                    extra={
+                                        'operation_type': 'reaction_error',
+                                        'chat_identifier': chat_identifier,
+                                        'message_id': event.message.id,
+                                        'reaction': selected_reaction,
+                                        'error': str(reaction_error),
+                                        'error_type': type(reaction_error).__name__,
+                                        'reaction_failures': target.reaction_failures,
+                                        'session_error_count': self._handler_error_count,
+                                        'cooldown': target.cooldown,
+                                        'session': str(self.session_file)
+                                    }
+                                )
+                                
+                                # Check for access loss and attempt rejoin (Requirement 4.4)
+                                await self._handle_monitoring_error(chat_identifier, reaction_error)
+                        else:
+                            # Queue reaction if cooldown has not passed (Requirements 2.4, 4.1)
+                            pending = PendingReaction(
+                                chat_identifier=chat_identifier,
+                                message_id=event.message.id,
+                                reaction=selected_reaction,
+                                queued_at=current_time
+                            )
+                            self.reaction_queue.append(pending)
+                            
+                            remaining_cooldown = target.cooldown - time_since_last
+                            # Log remaining cooldown time when reaction is queued (Requirements 5.4, Task 8)
+                            self.logger.info(
+                                f"[MONITOR] 📥 Queued reaction for {chat_identifier} (cooldown: {remaining_cooldown:.2f}s remaining)",
+                                extra={
+                                    'operation_type': 'reaction_queued',
+                                    'chat_identifier': chat_identifier,
+                                    'selected_reaction': selected_reaction,
+                                    'message_id': event.message.id,
+                                    'queue_size': len(self.reaction_queue),
+                                    'remaining_cooldown': remaining_cooldown,
+                                    'cooldown': target.cooldown,
+                                    'time_since_last': time_since_last,
+                                    'last_reaction_time': target.last_reaction_time,
+                                    'messages_processed': target.messages_processed,
+                                    'reactions_sent': target.reactions_sent,
+                                    'session': str(self.session_file)
+                                }
+                            )
+                        
+                    except Exception as e:
+                        # Track error count per session
+                        self._handler_error_count += 1
+                        # Log errors without crashing event loop (Requirement 3.5)
+                        error_context = f"chat: {chat_identifier}" if chat_identifier else "unknown chat"
+                        self.logger.error(
+                            f"[MONITOR] ❌ Error in message handler ({error_context}, "
+                            f"session errors: {self._handler_error_count}): {e}"
+                        )
+                        
+                        # Check for access loss if we have chat identifier (Requirement 4.4)
+                        if chat_identifier:
+                            await self._handle_monitoring_error(chat_identifier, e)
 
-            self._event_handler = message_handler
+                self._event_handler = message_handler
+                
+                # Log successful event handler registration (Requirements 3.1, 3.2)
+                self.logger.info(
+                    f"[MONITOR] ✅ Event handler registered successfully",
+                    extra={
+                        'handler_id': id(self._event_handler),
+                        'target_count': len(self.monitoring_targets),
+                        'session': str(self.session_file)
+                    }
+                )
+                
+            except Exception as e:
+                # Log error if handler registration fails (Requirement 3.3)
+                self.logger.error(
+                    f"[MONITOR] ❌ Failed to register event handler: {e}",
+                    extra={
+                        'error': str(e),
+                        'error_type': type(e).__name__,
+                        'session': str(self.session_file)
+                    },
+                    exc_info=True
+                )
+                raise
 
     def _get_chat_identifier(self, chat) -> str:
         """
@@ -935,9 +1305,13 @@ class TelegramSession:
             chat: Telegram chat object
             
         Returns:
-            str: Chat identifier (username or ID)
+            str: Chat identifier (username with @ prefix or ID)
         """
-        return getattr(chat, 'username', None) or f"id_{chat.id}"
+        username = getattr(chat, 'username', None)
+        if username:
+            # Add @ prefix to match how channels are stored in monitoring_targets
+            return f"@{username}" if not username.startswith('@') else username
+        return f"id_{chat.id}"
 
     async def _safe_react_to_message(self, chat, message_id: int, reaction: str) -> bool:
         """
@@ -946,21 +1320,246 @@ class TelegramSession:
         Args:
             chat: Chat object
             message_id: ID of message to react to
-            reaction: Emoji reaction
+            reaction: Emoji reaction string
             
         Returns:
             bool: True if reaction successful
         """
         try:
+            # Convert emoji string to ReactionEmoji object
+            reaction_obj = ReactionEmoji(emoticon=reaction)
+            
             await self.client(SendReactionRequest(
                 peer=chat,
                 msg_id=message_id,
-                reaction=reaction
+                reaction=[reaction_obj]  # Must be a list of reaction objects
             ))
             return True
         except Exception as e:
             self.logger.warning(f"⚠️ Failed to react to message: {e}")
             return False
+    
+    async def _handle_monitoring_error(self, chat_identifier: str, error: Exception):
+        """
+        Handle monitoring errors including access loss detection and rejoin attempts
+        
+        Args:
+            chat_identifier: Identifier of the chat where error occurred
+            error: The exception that occurred
+            
+        Requirements: 4.4
+        """
+        try:
+            # Import error types for access loss detection
+            from telethon.errors import (
+                ChannelPrivateError, 
+                ChatWriteForbiddenError,
+                UserBannedInChannelError,
+                ChannelInvalidError
+            )
+            
+            error_type = type(error).__name__
+            
+            # Detect access loss errors (Requirement 4.4)
+            if isinstance(error, (ChannelPrivateError, ChatWriteForbiddenError, UserBannedInChannelError)):
+                self.logger.warning(
+                    f"[MONITOR] 🚫 Access loss detected for {chat_identifier}: {error_type}"
+                )
+                
+                # Attempt to rejoin the channel (Requirement 4.4)
+                if isinstance(error, UserBannedInChannelError):
+                    # Don't attempt rejoin if banned
+                    self.logger.error(
+                        f"[MONITOR] ⛔ Session is banned from {chat_identifier}, cannot rejoin"
+                    )
+                    # Remove from monitoring targets
+                    if chat_identifier in self.monitoring_targets:
+                        del self.monitoring_targets[chat_identifier]
+                        self.logger.info(
+                            f"[MONITOR] 🗑️ Removed {chat_identifier} from monitoring due to ban"
+                        )
+                else:
+                    # Attempt rejoin for other access errors
+                    self.logger.info(
+                        f"[MONITOR] 🔄 Attempting to rejoin {chat_identifier}..."
+                    )
+                    success, rejoin_error = await self.join_channel_with_retry(chat_identifier)
+                    
+                    if success:
+                        self.logger.info(
+                            f"[MONITOR] ✅ Successfully rejoined {chat_identifier}"
+                        )
+                    else:
+                        self.logger.error(
+                            f"[MONITOR] ❌ Failed to rejoin {chat_identifier}: {rejoin_error}"
+                        )
+                        # Remove from monitoring targets if rejoin failed
+                        if chat_identifier in self.monitoring_targets:
+                            del self.monitoring_targets[chat_identifier]
+                            self.logger.info(
+                                f"[MONITOR] 🗑️ Removed {chat_identifier} from monitoring due to rejoin failure"
+                            )
+            
+            elif isinstance(error, ChannelInvalidError):
+                # Channel no longer exists
+                self.logger.error(
+                    f"[MONITOR] 🗑️ Channel {chat_identifier} no longer exists or is invalid"
+                )
+                # Remove from monitoring targets
+                if chat_identifier in self.monitoring_targets:
+                    del self.monitoring_targets[chat_identifier]
+                    self.logger.info(
+                        f"[MONITOR] 🗑️ Removed {chat_identifier} from monitoring"
+                    )
+            
+        except Exception as handler_error:
+            # Log error in error handler without propagating
+            self.logger.error(
+                f"[MONITOR] ❌ Error in monitoring error handler: {handler_error}"
+            )
+
+    async def _process_reaction_queue(self):
+        """
+        Process queued reactions respecting cooldown (Requirements 4.1, 4.2, 4.4, 4.5)
+        
+        This method runs continuously while monitoring is active, processing reactions
+        from the queue in FIFO order while respecting per-target cooldown periods.
+        """
+        self.logger.debug("[MONITOR] 🔄 Reaction queue processor started")
+        
+        while self.is_monitoring:
+            try:
+                # Check if queue has pending reactions
+                if not self.reaction_queue:
+                    await asyncio.sleep(0.1)  # Short sleep to avoid busy waiting
+                    continue
+                
+                # Get next reaction from queue (FIFO order - Requirement 4.2)
+                pending = self.reaction_queue.popleft()
+                target = self.monitoring_targets.get(pending.chat_identifier)
+                
+                if not target:
+                    # Target no longer being monitored, skip this reaction
+                    self.logger.debug(
+                        f"[MONITOR] ⏭️ Skipping queued reaction for {pending.chat_identifier} (no longer monitored)"
+                    )
+                    continue
+                
+                # Check cooldown before sending (Requirement 4.2)
+                current_time = time.time()
+                time_since_last = current_time - target.last_reaction_time
+                
+                # Track wait time for logging (Task 8)
+                actual_wait_time = 0.0
+                
+                if time_since_last < target.cooldown:
+                    # Wait for remaining cooldown time (Requirement 4.2)
+                    wait_time = target.cooldown - time_since_last
+                    # Log wait time when processing queued reactions (Requirements 5.4, Task 8)
+                    self.logger.info(
+                        f"[MONITOR] ⏳ Waiting {wait_time:.2f}s for cooldown before processing queued reaction",
+                        extra={
+                            'operation_type': 'reaction_cooldown_wait',
+                            'chat_identifier': pending.chat_identifier,
+                            'cooldown': target.cooldown,
+                            'time_since_last': time_since_last,
+                            'remaining_cooldown': wait_time,
+                            'message_id': pending.message_id,
+                            'reaction': pending.reaction,
+                            'queue_size': len(self.reaction_queue),
+                            'session': str(self.session_file)
+                        }
+                    )
+                    await asyncio.sleep(wait_time)
+                    actual_wait_time = wait_time
+                
+                # Send reaction (Requirement 4.2)
+                try:
+                    chat = await self.client.get_entity(pending.chat_identifier)
+                    success = await self._safe_react_to_message(
+                        chat, 
+                        pending.message_id, 
+                        pending.reaction
+                    )
+                    
+                    if success:
+                        # Update target statistics (Requirement 4.2)
+                        target.last_reaction_time = time.time()
+                        target.reactions_sent += 1
+                        
+                        # Calculate how long the reaction was queued
+                        queue_wait_time = time.time() - pending.queued_at
+                        
+                        # Log wait time when processing queued reactions (Requirements 5.4, Task 8)
+                        self.logger.info(
+                            f"[MONITOR] 🔔 Sent queued reaction to {pending.chat_identifier} "
+                            f"(queued: {queue_wait_time:.2f}s, cooldown wait: {actual_wait_time:.2f}s)",
+                            extra={
+                                'operation_type': 'reaction_sent_from_queue',
+                                'chat_identifier': pending.chat_identifier,
+                                'reaction': pending.reaction,
+                                'message_id': pending.message_id,
+                                'queue_size': len(self.reaction_queue),
+                                'queue_wait_time': queue_wait_time,
+                                'cooldown_wait_time': actual_wait_time,
+                                'total_wait_time': queue_wait_time,
+                                'reactions_sent': target.reactions_sent,
+                                'messages_processed': target.messages_processed,
+                                'cooldown': target.cooldown,
+                                'session': str(self.session_file)
+                            }
+                        )
+                    else:
+                        # Track failure (Requirement 4.5)
+                        target.reaction_failures += 1
+                        # Add structured logging for queued reaction failures (Task 8)
+                        self.logger.warning(
+                            f"[MONITOR] ⚠️ Failed to send queued reaction to {pending.chat_identifier} "
+                            f"(failures: {target.reaction_failures})",
+                            extra={
+                                'operation_type': 'reaction_queued_failed',
+                                'chat_identifier': pending.chat_identifier,
+                                'message_id': pending.message_id,
+                                'reaction': pending.reaction,
+                                'reaction_failures': target.reaction_failures,
+                                'queue_wait_time': time.time() - pending.queued_at,
+                                'cooldown': target.cooldown,
+                                'session': str(self.session_file)
+                            }
+                        )
+                
+                except Exception as e:
+                    # Handle errors without stopping processor (Requirement 4.2)
+                    target.reaction_failures += 1
+                    # Add structured logging for queue processing errors (Task 8)
+                    self.logger.error(
+                        f"[MONITOR] ❌ Error processing queued reaction for {pending.chat_identifier}: {e} "
+                        f"(failures: {target.reaction_failures})",
+                        extra={
+                            'operation_type': 'reaction_queue_error',
+                            'chat_identifier': pending.chat_identifier,
+                            'message_id': pending.message_id,
+                            'reaction': pending.reaction,
+                            'error': str(e),
+                            'error_type': type(e).__name__,
+                            'reaction_failures': target.reaction_failures,
+                            'queue_wait_time': time.time() - pending.queued_at,
+                            'cooldown': target.cooldown,
+                            'session': str(self.session_file)
+                        }
+                    )
+                    # Check for access loss
+                    await self._handle_monitoring_error(pending.chat_identifier, e)
+                
+            except Exception as e:
+                # Log unexpected errors without stopping processor (Requirement 4.2)
+                self.logger.error(
+                    f"[MONITOR] ❌ Unexpected error in reaction queue processor: {e}",
+                    exc_info=True
+                )
+                await asyncio.sleep(1)  # Brief delay before continuing
+        
+        self.logger.debug("[MONITOR] 🛑 Reaction queue processor stopped")
 
     async def send_message(self, target: str, message: str, reply_to: int = None) -> bool:
         """
@@ -1123,37 +1722,229 @@ class TelegramSession:
                 'error': str(e)
             }
 
-    async def join_chat(self, target: str) -> bool:
+    def _normalize_channel_id(self, channel_id: str) -> str:
         """
-        Simplified join_chat method using correct Telegram methods
+        Normalize channel identifier to a standard format
+        
+        Args:
+            channel_id: Channel username (@channel), ID, or invite link
+            
+        Returns:
+            Normalized channel identifier
+        """
+        if not channel_id:
+            return channel_id
+            
+        # Already normalized username
+        if channel_id.startswith('@'):
+            return channel_id
+            
+        # Numeric ID
+        if channel_id.lstrip('-').isdigit():
+            return channel_id
+            
+        # Invite links - keep as is
+        if 'joinchat' in channel_id or channel_id.startswith('https://t.me/+') or channel_id.startswith('t.me/+'):
+            return channel_id
+            
+        # Plain username without @
+        if channel_id.replace('_', '').isalnum():
+            return f"@{channel_id}"
+            
+        return channel_id
+
+    async def get_channel_entity(self, channel_id: str):
+        """
+        Get channel entity, handling various identifier formats
+        
+        Args:
+            channel_id: Channel username (@channel), ID, or invite link
+            
+        Returns:
+            Channel entity
+            
+        Raises:
+            Various Telegram errors
         """
         try:
+            # For invite links, we need to handle them differently
+            if 'joinchat' in channel_id or '+' in channel_id:
+                # For invite links, we can't get entity before joining
+                # Return the link itself as a marker
+                return channel_id
+            
+            # For usernames and IDs, use get_entity
+            entity = await self.client.get_entity(channel_id)
+            return entity
+            
+        except Exception as e:
+            self.logger.error(f"❌ Failed to get entity for {channel_id}: {e}")
+            raise
+
+    async def is_channel_member(self, channel_id: str) -> bool:
+        """
+        Check if this session is a member of the channel
+        
+        Args:
+            channel_id: Channel username (@channel), ID, or invite link
+            
+        Returns:
+            True if session is a member, False otherwise
+        """
+        try:
+            # Normalize the identifier
+            normalized_id = self._normalize_channel_id(channel_id)
+            
+            # For invite links, we can't check membership without joining
+            if 'joinchat' in normalized_id or ('+' in normalized_id and 't.me' in normalized_id):
+                # Can't check membership for invite links
+                return False
+            
+            # Get the entity
+            entity = await self.client.get_entity(normalized_id)
+            
+            # Get full channel info to check membership
+            from telethon.tl.functions.channels import GetFullChannelRequest
+            full_channel = await self.client(GetFullChannelRequest(entity))
+            
+            # Check if we're a participant
+            # If we can access full channel info, we're likely a member
+            # More reliable check: try to get our participant status
+            try:
+                from telethon.tl.functions.channels import GetParticipantRequest
+                me = await self.client.get_me()
+                await self.client(GetParticipantRequest(entity, me))
+                return True
+            except Exception:
+                # If GetParticipant fails, we're not a member
+                return False
+                
+        except Exception as e:
+            self.logger.debug(f"Membership check failed for {channel_id}: {e}")
+            return False
+
+    async def join_channel(self, channel_id: str) -> tuple[bool, Optional[str]]:
+        """
+        Join a channel by identifier
+        
+        Args:
+            channel_id: Channel username (@channel), ID, or invite link
+            
+        Returns:
+            Tuple of (success: bool, error_message: Optional[str])
+        """
+        try:
+            # Normalize identifier
+            normalized_id = self._normalize_channel_id(channel_id)
+            
+            # Check if already a member
+            if await self.is_channel_member(normalized_id):
+                self.logger.info(f"✅ Already a member of {normalized_id}")
+                return (True, None)
+            
             # Handle private invite links
-            if target.startswith('https://t.me/+') or target.startswith('t.me/+'):
+            if 'joinchat' in normalized_id or ('+' in normalized_id and 't.me' in normalized_id):
                 # Extract invite hash
-                invite_hash = target.split('/')[-1]
+                invite_hash = normalized_id.split('/')[-1]
                 if invite_hash.startswith('+'):
                     invite_hash = invite_hash[1:]
                 
-                self.logger.info(f"🔑 Joining private group with hash: {invite_hash}")
+                self.logger.info(f"🔑 Joining private channel with invite hash")
                 
                 # Use ImportChatInviteRequest for private links
-                from telethon.tl.functions.messages import ImportChatInviteRequest
                 await self.client(ImportChatInviteRequest(invite_hash))
-                self.logger.info(f"✅ Successfully joined private group")
-                return True
-                
+                self.logger.info(f"✅ Successfully joined private channel")
+                return (True, None)
+            
+            # Get channel entity
+            entity = await self.get_channel_entity(normalized_id)
+            
+            # Join channel
+            await self.client(JoinChannelRequest(entity))
+            
+            # Verify membership
+            if await self.is_channel_member(normalized_id):
+                self.logger.info(f"✅ Successfully joined {normalized_id}")
+                return (True, None)
             else:
-                # For public groups/channels
-                entity = await self.client.get_entity(target)
-                from telethon.tl.functions.channels import JoinChannelRequest
-                await self.client(JoinChannelRequest(entity))
-                self.logger.info(f"✅ Successfully joined {target}")
-                return True
+                return (False, "Join succeeded but membership verification failed")
                 
         except Exception as e:
-            self.logger.error(f"❌ Failed to join {target}: {e}")
-            return False
+            # Import error types
+            from telethon.errors import (
+                ChannelPrivateError, ChannelInvalidError, 
+                UserBannedInChannelError, FloodWaitError
+            )
+            
+            # Handle specific errors
+            error_type = type(e).__name__
+            
+            if isinstance(e, ChannelPrivateError):
+                error_msg = "Channel is private - invite link required"
+            elif isinstance(e, ChannelInvalidError):
+                error_msg = "Channel not found or invalid"
+            elif isinstance(e, UserBannedInChannelError):
+                error_msg = "Session is banned from this channel"
+            elif isinstance(e, FloodWaitError):
+                error_msg = f"Rate limited - wait {e.seconds} seconds"
+            else:
+                error_msg = f"Unexpected error: {str(e)}"
+            
+            self.logger.error(f"❌ Failed to join {channel_id}: {error_msg}")
+            return (False, error_msg)
+
+    async def join_channel_with_retry(self, channel_id: str, max_retries: int = 5) -> tuple[bool, Optional[str]]:
+        """
+        Join a channel with retry logic and exponential backoff
+        
+        Implements exponential backoff: 1s, 2s, 4s, 8s, 16s
+        Skips retry for permanent errors (private, invalid, banned)
+        
+        Args:
+            channel_id: Channel username (@channel), ID, or invite link
+            max_retries: Maximum number of retry attempts (default: 5)
+            
+        Returns:
+            Tuple of (success: bool, error_message: Optional[str])
+        """
+        for attempt in range(max_retries):
+            # Log retry attempt
+            if attempt == 0:
+                self.logger.info(f"🔄 Attempting to join channel {channel_id}")
+            else:
+                self.logger.info(f"🔄 Retry attempt {attempt}/{max_retries - 1} for channel {channel_id}")
+            
+            # Attempt to join
+            success, error = await self.join_channel(channel_id)
+            
+            if success:
+                return (True, None)
+            
+            # Check if error is permanent (don't retry)
+            if error and any(keyword in error.lower() for keyword in ["private", "invalid", "banned"]):
+                self.logger.warning(f"⚠️ Permanent error detected, skipping retry: {error}")
+                return (False, error)
+            
+            # If this was the last attempt, return the error
+            if attempt >= max_retries - 1:
+                self.logger.error(f"❌ Failed to join {channel_id} after {max_retries} attempts: {error}")
+                return (False, f"Failed after {max_retries} attempts: {error}")
+            
+            # Calculate exponential backoff delay: 2^attempt seconds (1s, 2s, 4s, 8s, 16s)
+            delay = 2 ** attempt
+            self.logger.info(f"⏱️ Waiting {delay}s before retry...")
+            await asyncio.sleep(delay)
+        
+        # This should never be reached, but just in case
+        return (False, f"Failed after {max_retries} attempts")
+
+    async def join_chat(self, target: str) -> bool:
+        """
+        Simplified join_chat method using correct Telegram methods
+        (Kept for backward compatibility)
+        """
+        success, error = await self.join_channel(target)
+        return success
 
     async def get_members(self, target: str, limit: int = 100) -> List[Dict]:
         """
@@ -1310,6 +2101,92 @@ class TelegramSession:
             'monitoring_active': self.is_monitoring,
             'monitoring_targets_count': len(self.monitoring_targets)
         }
+    
+    def get_monitoring_statistics(self, channel_id: Optional[str] = None) -> Dict:
+        """
+        Get monitoring statistics for channels
+        
+        Args:
+            channel_id: Optional channel ID to get stats for. If None, returns stats for all channels.
+            
+        Returns:
+            Dict with monitoring statistics (Requirement 4.3)
+        """
+        if channel_id:
+            # Get stats for specific channel
+            target = self.monitoring_targets.get(channel_id)
+            if not target:
+                return {
+                    'channel_id': channel_id,
+                    'monitoring_active': False,
+                    'reactions_sent': 0,
+                    'messages_processed': 0,
+                    'reaction_failures': 0
+                }
+            
+            return {
+                'channel_id': channel_id,
+                'monitoring_active': True,
+                'reactions_sent': target.reactions_sent,
+                'messages_processed': target.messages_processed,
+                'reaction_failures': target.reaction_failures,
+                'last_reaction_time': target.last_reaction_time,
+                'cooldown': target.cooldown
+            }
+        else:
+            # Get stats for all channels
+            stats = {}
+            for channel_id, target in self.monitoring_targets.items():
+                stats[channel_id] = {
+                    'monitoring_active': True,
+                    'reactions_sent': target.reactions_sent,
+                    'messages_processed': target.messages_processed,
+                    'reaction_failures': target.reaction_failures,
+                    'last_reaction_time': target.last_reaction_time,
+                    'cooldown': target.cooldown
+                }
+            return stats
+    
+    def get_monitoring_health(self) -> Dict[str, Any]:
+        """
+        Get monitoring health status
+        
+        Returns comprehensive health information about the monitoring system including:
+        - Overall monitoring status (is_monitoring flag)
+        - Number of targets being monitored
+        - Reaction queue size
+        - Per-target statistics (messages_processed, reactions_sent, failures)
+        - Per-target timing information (last_reaction_time, time_since_last_reaction)
+        - Per-target configuration (cooldown)
+        
+        Returns:
+            Dict with health information
+            
+        Requirements: 6.1, 6.2, 6.3, 6.4, 6.5
+        """
+        # Get current time for calculating time_since_last_reaction
+        current_time = time.time()
+        
+        # Build health status dictionary (Requirement 6.1)
+        health = {
+            'is_monitoring': self.is_monitoring,  # Requirement 6.1
+            'target_count': len(self.monitoring_targets),  # Requirement 6.1
+            'queue_size': len(self.reaction_queue) if hasattr(self, 'reaction_queue') else 0,  # Requirement 6.1
+            'targets': {}
+        }
+        
+        # Add per-target statistics (Requirements 6.2, 6.3, 6.4, 6.5)
+        for chat_id, target in self.monitoring_targets.items():
+            health['targets'][chat_id] = {
+                'messages_processed': target.messages_processed,  # Requirement 6.2
+                'reactions_sent': target.reactions_sent,  # Requirement 6.3
+                'reaction_failures': target.reaction_failures,  # Requirement 6.3
+                'last_reaction_time': target.last_reaction_time,  # Requirement 6.4
+                'cooldown': target.cooldown,  # Requirement 6.5
+                'time_since_last_reaction': current_time - target.last_reaction_time  # Requirement 6.4
+            }
+        
+        return health
     
     async def scrape_group_members(self, group_identifier: str, max_members: int = 10000, fallback_to_messages: bool = True, message_days_back: int = 10) -> Dict:
         """

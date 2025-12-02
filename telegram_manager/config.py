@@ -22,8 +22,12 @@ class MonitoringTarget:
     chat_id: str
     reaction_pool: Optional[ReactionPool] = None
     reaction: Optional[str] = None  # Deprecated, kept for backward compatibility
-    cooldown: float = 2.0
+    cooldown: float = 1.0
     last_reaction_time: float = 0
+    # Statistics tracking (Requirement 4.3)
+    reactions_sent: int = 0
+    messages_processed: int = 0
+    reaction_failures: int = 0
 
     def __post_init__(self):
         """Initialize reaction pool from single reaction if needed"""
@@ -84,7 +88,7 @@ class MonitoringTarget:
             MonitoringTarget instance
         """
         chat_id = data['chat_id']
-        cooldown = data.get('cooldown', 2.0)
+        cooldown = data.get('cooldown', 1.0)
         
         # Check if reaction_pool is present
         if 'reaction_pool' in data:

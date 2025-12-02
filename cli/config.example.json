@@ -1,0 +1,221 @@
+{
+  "_comment_version": "Configuration file format version - do not modify",
+  "version": "1.0",
+  
+  "_comment_channels": "List of Telegram channels/groups to monitor and scrape",
+  "channels": [
+    {
+      "_comment_channel_id": "Unique identifier for the channel (can be numeric ID or username)",
+      "channel_id": "1234567890",
+      
+      "_comment_channel_name": "Human-readable name for the channel (for display purposes)",
+      "channel_name": "Tech News Channel",
+      
+      "_comment_channel_username": "Channel username without @ symbol (optional, null if private channel)",
+      "channel_username": "technewschannel",
+      
+      "_comment_reactions": "List of emoji reactions to use when interacting with this channel",
+      "reactions": [
+        {
+          "_comment_emoji": "Unicode emoji character to use as reaction",
+          "emoji": "👍",
+          
+          "_comment_weight": "Weight/probability for this reaction (higher = more likely to be selected)",
+          "weight": 3
+        },
+        {
+          "emoji": "❤️",
+          "weight": 2
+        },
+        {
+          "emoji": "🔥",
+          "weight": 1
+        }
+      ],
+      
+      "_comment_scraping_enabled": "Whether to allow scraping operations on this channel (true/false)",
+      "scraping_enabled": true,
+      
+      "_comment_monitoring_enabled": "Whether to actively monitor this channel for new messages (true/false)",
+      "monitoring_enabled": false,
+      
+      "_comment_created_at": "Unix timestamp when this channel was added to configuration",
+      "created_at": 1701360000.0
+    },
+    {
+      "channel_id": "cryptonews",
+      "channel_name": "Crypto Updates",
+      "channel_username": "cryptonews",
+      "reactions": [
+        {
+          "emoji": "🚀",
+          "weight": 5
+        },
+        {
+          "emoji": "💎",
+          "weight": 3
+        },
+        {
+          "emoji": "📈",
+          "weight": 2
+        }
+      ],
+      "scraping_enabled": true,
+      "monitoring_enabled": true,
+      "created_at": 1701360000.0
+    },
+    {
+      "_comment_private_channel": "Example of a private channel configuration (no username)",
+      "channel_id": "-1001234567890",
+      "channel_name": "Private Group",
+      "channel_username": null,
+      "reactions": [
+        {
+          "emoji": "👀",
+          "weight": 1
+        }
+      ],
+      "scraping_enabled": true,
+      "monitoring_enabled": false,
+      "created_at": 1701360000.0
+    }
+  ],
+  
+  "_comment_jobs": "List of scheduled jobs for automated operations",
+  "jobs": [
+    {
+      "_comment_job_id": "Unique identifier for this job (used for management operations)",
+      "job_id": "scrape_tech_links",
+      
+      "_comment_job_type": "Type of job: 'scrape_members', 'scrape_messages', 'scrape_links', or 'send_messages'",
+      "job_type": "scrape_links",
+      
+      "_comment_schedule_interval": "How often to run this job in hours (e.g., 12 = every 12 hours)",
+      "schedule_interval": 12,
+      
+      "_comment_target_channel": "Channel ID to operate on (must match a channel_id from channels list)",
+      "target_channel": "1234567890",
+      
+      "_comment_parameters": "Job-specific parameters (varies by job_type)",
+      "parameters": {
+        "_comment_days_back": "For scraping jobs: how many days of history to scrape",
+        "days_back": 1,
+        
+        "_comment_output_dir": "Directory where scraping results will be saved",
+        "output_dir": "data/links",
+        
+        "_comment_include_statistics": "Whether to generate statistics about scraped links",
+        "include_statistics": true
+      },
+      
+      "_comment_enabled": "Whether this job is active (false = job exists but won't run)",
+      "enabled": true,
+      
+      "_comment_created_at": "Unix timestamp when this job was created",
+      "created_at": 1701360000.0
+    },
+    {
+      "job_id": "scrape_crypto_members",
+      "job_type": "scrape_members",
+      "schedule_interval": 24,
+      "target_channel": "cryptonews",
+      "parameters": {
+        "_comment_output_format": "Format for member list: 'csv' or 'json'",
+        "output_format": "csv",
+        
+        "output_dir": "data/members",
+        
+        "_comment_include_details": "Whether to include detailed member information (bio, username, etc.)",
+        "include_details": true
+      },
+      "enabled": true,
+      "created_at": 1701360000.0
+    },
+    {
+      "job_id": "scrape_tech_messages",
+      "job_type": "scrape_messages",
+      "schedule_interval": 6,
+      "target_channel": "1234567890",
+      "parameters": {
+        "days_back": 7,
+        "output_dir": "data/messages",
+        "output_format": "json",
+        
+        "_comment_filter_keywords": "Optional: only save messages containing these keywords",
+        "filter_keywords": ["announcement", "update", "release"],
+        
+        "_comment_include_media": "Whether to download and save media files from messages",
+        "include_media": false
+      },
+      "enabled": false,
+      "created_at": 1701360000.0
+    },
+    {
+      "_comment_bulk_send_job": "Example of a scheduled bulk message sending job",
+      "job_id": "daily_newsletter",
+      "job_type": "send_messages",
+      "schedule_interval": 24,
+      "target_channel": null,
+      "parameters": {
+        "_comment_csv_file": "Path to CSV file containing recipients and message content",
+        "csv_file": "data/newsletter_recipients.csv",
+        
+        "_comment_message_template": "Template for message content (can use variables from CSV)",
+        "message_template": "Hello {name}, here's your daily update!",
+        
+        "_comment_delay_between_messages": "Delay in seconds between each message (to avoid rate limits)",
+        "delay_between_messages": 3.0,
+        
+        "_comment_skip_blacklisted": "Whether to skip users on the blacklist",
+        "skip_blacklisted": true
+      },
+      "enabled": false,
+      "created_at": 1701360000.0
+    }
+  ],
+  
+  "_comment_preferences": "Global preferences for CLI panel behavior",
+  "preferences": {
+    "_comment_default_delay": "Default delay in seconds between operations (to avoid rate limits)",
+    "default_delay": 2.0,
+    
+    "_comment_auto_save": "Whether to automatically save configuration after changes (true/false)",
+    "auto_save": true,
+    
+    "_comment_show_progress": "Whether to display progress bars during long operations (true/false)",
+    "show_progress": true,
+    
+    "_comment_log_level": "Logging verbosity: 'DEBUG', 'INFO', 'WARNING', 'ERROR'",
+    "log_level": "INFO",
+    
+    "_comment_max_concurrent_operations": "Maximum number of concurrent scraping/sending operations",
+    "max_concurrent_operations": 3,
+    
+    "_comment_retry_attempts": "Number of times to retry failed operations",
+    "retry_attempts": 3,
+    
+    "_comment_retry_delay": "Delay in seconds between retry attempts",
+    "retry_delay": 5.0,
+    
+    "_comment_output_format": "Default output format for scraping results: 'json' or 'csv'",
+    "output_format": "json",
+    
+    "_comment_date_format": "Date format for display and file naming (Python strftime format)",
+    "date_format": "%Y-%m-%d %H:%M:%S",
+    
+    "_comment_timezone": "Timezone for timestamps (e.g., 'UTC', 'America/New_York', 'Europe/London')",
+    "timezone": "UTC",
+    
+    "_comment_color_output": "Whether to use colored output in terminal (true/false)",
+    "color_output": true,
+    
+    "_comment_confirm_destructive_operations": "Whether to ask for confirmation before deleting/clearing data",
+    "confirm_destructive_operations": true,
+    
+    "_comment_backup_config": "Whether to create backup of config file before saving changes",
+    "backup_config": true,
+    
+    "_comment_session_timeout": "Session timeout in seconds (0 = no timeout)",
+    "session_timeout": 3600
+  }
+}

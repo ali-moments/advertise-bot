@@ -1,0 +1,13 @@
+# Core Telegram dependencies
+telethon>=1.24.0
+
+# CLI Panel dependencies
+rich>=13.0.0
+apscheduler>=3.10.0
+prompt_toolkit>=3.0.0
+aioconsole>=0.6.0
+
+# Testing dependencies
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+hypothesis>=6.0.0

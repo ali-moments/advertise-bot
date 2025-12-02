@@ -53,7 +53,7 @@ class MonitoringSession:
     action: str  # 'add', 'remove', 'edit_reactions', 'edit_cooldown', 'list'
     channel_link: Optional[str] = None
     reactions: List[Dict[str, Any]] = field(default_factory=list)
-    cooldown: float = 2.0
+    cooldown: float = 1.0
     selected_channel: Optional[str] = None
     edit_type: Optional[str] = None  # 'reactions' or 'cooldown'
     started_at: float = field(default_factory=time.time)
@@ -276,7 +276,7 @@ class MonitoringHandler:
 {i}. **{chat_id}**
    وضعیت: {status_icon} {'فعال' if is_active else 'غیرفعال'}
    ری‌اکشن‌ها: {reactions_str}
-   کولداون: {config.get('cooldown', 2.0)}s
+   کولداون: {config.get('cooldown', 1.0)}s
    آمار: {reactions_sent} ری‌اکشن، {messages_processed} پیام
 """
         
@@ -414,10 +414,11 @@ class MonitoringHandler:
 حالا لطفاً کولداون (فاصله زمانی بین ری‌اکشن‌ها) را به ثانیه وارد کنید:
 
 **مثال:**
-`2.0` (2 ثانیه)
-`3.5` (3.5 ثانیه)
+`1.0` (1 ثانیه - پیش‌فرض)
+`2.5` (2.5 ثانیه)
 
-**پیشنهاد:** 2.0 تا 5.0 ثانیه
+**پیشنهاد:** 1.0 تا 5.0 ثانیه
+**پیش‌فرض:** 1.0 ثانیه
 """
             
             await update.message.reply_text(message, parse_mode='Markdown')
@@ -449,7 +450,7 @@ class MonitoringHandler:
         try:
             cooldown = float(cooldown_text)
             if cooldown < 0.5 or cooldown > 60:
-                raise ValueError("کولداون باید بین 0.5 تا 60 ثانیه باشد")
+                raise ValueError("کولداون باید بین 0.5 تا 60 ثانیه باشد (پیش‌فرض: 1.0)")
             
             session.cooldown = cooldown
             
@@ -475,7 +476,8 @@ class MonitoringHandler:
 
 {str(e)}
 
-لطفاً یک عدد معتبر وارد کنید (مثال: 2.0)
+لطفاً یک عدد معتبر وارد کنید (مثال: 1.0)
+**پیش‌فرض:** 1.0 ثانیه
 """
             await update.message.reply_text(error_msg, parse_mode='Markdown')
             return GET_COOLDOWN
@@ -807,7 +809,7 @@ class MonitoringHandler:
 
 **کانال:** {channel}
 **ری‌اکشن‌های فعلی:** {self._format_reactions(config.get('reactions', []))}
-**کولداون فعلی:** {config.get('cooldown', 2.0)}s
+**کولداون فعلی:** {config.get('cooldown', 1.0)}s
 
 چه چیزی را می‌خواهید ویرایش کنید؟
 """
@@ -863,10 +865,10 @@ class MonitoringHandler:
 لطفاً کولداون جدید را به ثانیه وارد کنید:
 
 **مثال:**
-`2.0` (2 ثانیه)
-`3.5` (3.5 ثانیه)
+`1.0` (1 ثانیه)
+`2.5` (2.5 ثانیه)
 
-**پیشنهاد:** 2.0 تا 5.0 ثانیه
+**پیشنهاد:** 1.0 تا 5.0 ثانیه
 """
             await query.edit_message_text(message, parse_mode='Markdown')
             return GET_NEW_COOLDOWN
@@ -933,7 +935,7 @@ class MonitoringHandler:
         try:
             cooldown = float(cooldown_text)
             if cooldown < 0.5 or cooldown > 60:
-                raise ValueError("کولداون باید بین 0.5 تا 60 ثانیه باشد")
+                raise ValueError("کولداون باید بین 0.5 تا 60 ثانیه باشد (پیش‌فرض: 1.0)")
             
             session.cooldown = cooldown
             
@@ -959,7 +961,8 @@ class MonitoringHandler:
 
 {str(e)}
 
-لطفاً یک عدد معتبر وارد کنید (مثال: 2.0)
+لطفاً یک عدد معتبر وارد کنید (مثال: 1.0)
+**پیش‌فرض:** 1.0 ثانیه
 """
             await update.message.reply_text(error_msg, parse_mode='Markdown')
             return GET_NEW_COOLDOWN
@@ -1077,7 +1080,7 @@ class MonitoringHandler:
                             'reaction_pool': {
                                 'reactions': config.get('reactions', [])
                             },
-                            'cooldown': config.get('cooldown', 2.0)
+                            'cooldown': config.get('cooldown', 1.0)
                         })
                 
                 await self.session_manager.start_global_monitoring(targets)
@@ -1197,7 +1200,7 @@ class MonitoringHandler:
 
 **تنظیمات:**
 • ری‌اکشن‌ها: {self._format_reactions(config.get('reactions', []))}
-• کولداون: {config.get('cooldown', 2.0)}s
+• کولداون: {config.get('cooldown', 1.0)}s
 
 **آمار:**
 • ری‌اکشن‌های ارسالی: {stats.get('reactions_sent', 0)}
@@ -1236,7 +1239,7 @@ class MonitoringHandler:
                     'reaction_pool': {
                         'reactions': config.get('reactions', [])
                     },
-                    'cooldown': config.get('cooldown', 2.0)
+                    'cooldown': config.get('cooldown', 1.0)
                 })
         
         if targets:
@@ -1312,7 +1315,7 @@ class MonitoringHandler:
 """
         elif session.edit_type == 'cooldown':
             message += f"""
-**کولداون قبلی:** {config.get('cooldown', 2.0)}s
+**کولداون قبلی:** {config.get('cooldown', 1.0)}s
 **کولداون جدید:** {session.cooldown}s
 """
         

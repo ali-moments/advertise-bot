@@ -73,3 +73,5 @@ coverage.xml
 .kiro/logs/
 
 tests/*
+cli/config.minimal.json
+cli/config.json

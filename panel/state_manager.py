@@ -164,7 +164,7 @@ class MonitoringConfig:
     """
     chat_id: str
     reactions: List[Dict[str, Any]] = field(default_factory=list)
-    cooldown: float = 2.0
+    cooldown: float = 1.0
     enabled: bool = True
     added_at: float = field(default_factory=time.time)
     stats: Dict[str, int] = field(default_factory=lambda: {
@@ -475,7 +475,7 @@ class StateManager:
         self,
         chat_id: str,
         reactions: Optional[List[Dict[str, Any]]] = None,
-        cooldown: float = 2.0,
+        cooldown: float = 1.0,
         enabled: bool = True
     ) -> MonitoringConfig:
         """

@@ -1546,6 +1546,345 @@ class TelegramSessionManager:
         
         return stats
     
+    async def join_channel_all_sessions(self, channel_id: str) -> Dict[str, bool]:
+        """
+        Attempt to join channel with all active sessions
+        
+        Each session attempts to join the channel independently. Failures in one
+        session do not affect other sessions (Requirement 2.3).
+        
+        Args:
+            channel_id: Channel username (@channel), ID, or invite link
+            
+        Returns:
+            Dict mapping session_name to join success status (True/False)
+            
+        Requirements: 2.1, 2.2, 2.3
+        """
+        results = {}
+        
+        if not self.sessions:
+            self.logger.warning("⚠️ No sessions available for joining channel")
+            return results
+        
+        # Create join tasks for all sessions
+        join_tasks = []
+        for session_name, session in self.sessions.items():
+            if session.is_connected:
+                task = asyncio.create_task(
+                    self._join_channel_single_session(session_name, session, channel_id)
+                )
+                join_tasks.append((session_name, task))
+            else:
+                self.logger.warning(f"⚠️ Session {session_name} is not connected, skipping join")
+                results[session_name] = False
+        
+        # Wait for all join attempts to complete
+        for session_name, task in join_tasks:
+            try:
+                success = await task
+                results[session_name] = success
+            except Exception as e:
+                # Log failure but continue with other sessions (Requirement 2.3)
+                self.logger.error(f"❌ Exception during join for session {session_name}: {e}")
+                results[session_name] = False
+        
+        # Log summary
+        succeeded = sum(1 for success in results.values() if success)
+        failed = len(results) - succeeded
+        self.logger.info(
+            f"📊 Channel join complete: {succeeded} succeeded, {failed} failed out of {len(results)} sessions"
+        )
+        
+        return results
+    
+    async def _join_channel_single_session(
+        self, 
+        session_name: str, 
+        session: TelegramSession, 
+        channel_id: str
+    ) -> bool:
+        """
+        Helper method to join channel with a single session
+        
+        Args:
+            session_name: Name of the session
+            session: TelegramSession instance
+            channel_id: Channel identifier
+            
+        Returns:
+            True if join succeeded, False otherwise
+        """
+        try:
+            # Use retry logic for joining (Requirement 5.5)
+            success, error = await session.join_channel_with_retry(channel_id)
+            
+            if success:
+                # Log successful join (Requirement 2.2)
+                self.logger.info(
+                    f"✅ Session {session_name} successfully joined channel {channel_id}",
+                    extra={
+                        'operation_type': 'channel_join',
+                        'session_name': session_name,
+                        'channel_id': channel_id,
+                        'success': True
+                    }
+                )
+                return True
+            else:
+                # Log failure (Requirement 2.3)
+                self.logger.warning(
+                    f"❌ Session {session_name} failed to join channel {channel_id}: {error}",
+                    extra={
+                        'operation_type': 'channel_join',
+                        'session_name': session_name,
+                        'channel_id': channel_id,
+                        'success': False,
+                        'error': error
+                    }
+                )
+                return False
+                
+        except Exception as e:
+            # Log exception (Requirement 2.3)
+            self.logger.error(
+                f"❌ Exception during join for session {session_name}: {e}",
+                extra={
+                    'operation_type': 'channel_join',
+                    'session_name': session_name,
+                    'channel_id': channel_id,
+                    'success': False,
+                    'error': str(e)
+                }
+            )
+            return False
+    
+    async def verify_channel_membership(self, channel_id: str) -> Dict[str, bool]:
+        """
+        Verify which sessions are members of a channel
+        
+        Checks membership status for all active sessions without attempting to join.
+        
+        Args:
+            channel_id: Channel username (@channel), ID, or invite link
+            
+        Returns:
+            Dict mapping session_name to membership status (True if member, False otherwise)
+            
+        Requirements: 2.4
+        """
+        results = {}
+        
+        if not self.sessions:
+            self.logger.warning("⚠️ No sessions available for membership verification")
+            return results
+        
+        # Create verification tasks for all sessions
+        verify_tasks = []
+        for session_name, session in self.sessions.items():
+            if session.is_connected:
+                task = asyncio.create_task(
+                    self._verify_membership_single_session(session_name, session, channel_id)
+                )
+                verify_tasks.append((session_name, task))
+            else:
+                self.logger.debug(f"Session {session_name} is not connected, marking as non-member")
+                results[session_name] = False
+        
+        # Wait for all verification tasks to complete
+        for session_name, task in verify_tasks:
+            try:
+                is_member = await task
+                results[session_name] = is_member
+            except Exception as e:
+                self.logger.error(f"❌ Exception during membership verification for session {session_name}: {e}")
+                results[session_name] = False
+        
+        # Log summary
+        members = sum(1 for is_member in results.values() if is_member)
+        non_members = len(results) - members
+        self.logger.info(
+            f"📊 Membership verification complete: {members} members, {non_members} non-members out of {len(results)} sessions"
+        )
+        
+        return results
+    
+    async def _verify_membership_single_session(
+        self,
+        session_name: str,
+        session: TelegramSession,
+        channel_id: str
+    ) -> bool:
+        """
+        Helper method to verify membership for a single session
+        
+        Args:
+            session_name: Name of the session
+            session: TelegramSession instance
+            channel_id: Channel identifier
+            
+        Returns:
+            True if session is a member, False otherwise
+        """
+        try:
+            is_member = await session.is_channel_member(channel_id)
+            self.logger.debug(
+                f"Session {session_name} membership for {channel_id}: {is_member}"
+            )
+            return is_member
+        except Exception as e:
+            self.logger.error(
+                f"❌ Exception during membership check for session {session_name}: {e}"
+            )
+            return False
+    
+    async def get_channel_join_status(self, channel_id: str) -> Dict[str, Dict]:
+        """
+        Get detailed join status for a channel across all sessions
+        
+        Returns comprehensive status information including membership status
+        and any errors encountered during verification.
+        
+        Args:
+            channel_id: Channel username (@channel), ID, or invite link
+            
+        Returns:
+            Dict mapping session_name to status dict with keys:
+                - 'joined': bool (True if member, False otherwise)
+                - 'error': Optional[str] (error message if verification failed)
+                
+        Requirements: 4.1
+        """
+        results = {}
+        
+        if not self.sessions:
+            self.logger.warning("⚠️ No sessions available for join status check")
+            return results
+        
+        # Create status check tasks for all sessions
+        status_tasks = []
+        for session_name, session in self.sessions.items():
+            if session.is_connected:
+                task = asyncio.create_task(
+                    self._get_join_status_single_session(session_name, session, channel_id)
+                )
+                status_tasks.append((session_name, task))
+            else:
+                results[session_name] = {
+                    'joined': False,
+                    'error': 'Session not connected'
+                }
+        
+        # Wait for all status checks to complete
+        for session_name, task in status_tasks:
+            try:
+                status = await task
+                results[session_name] = status
+            except Exception as e:
+                self.logger.error(f"❌ Exception during status check for session {session_name}: {e}")
+                results[session_name] = {
+                    'joined': False,
+                    'error': f'Exception: {str(e)}'
+                }
+        
+        # Log summary
+        joined_count = sum(1 for status in results.values() if status['joined'])
+        self.logger.info(
+            f"📊 Join status check complete: {joined_count}/{len(results)} sessions are members of {channel_id}"
+        )
+        
+        return results
+    
+    async def _get_join_status_single_session(
+        self,
+        session_name: str,
+        session: TelegramSession,
+        channel_id: str
+    ) -> Dict:
+        """
+        Helper method to get join status for a single session
+        
+        Args:
+            session_name: Name of the session
+            session: TelegramSession instance
+            channel_id: Channel identifier
+            
+        Returns:
+            Dict with 'joined' (bool) and 'error' (Optional[str]) keys
+        """
+        try:
+            is_member = await session.is_channel_member(channel_id)
+            return {
+                'joined': is_member,
+                'error': None
+            }
+        except Exception as e:
+            error_msg = str(e)
+            self.logger.error(
+                f"❌ Error checking join status for session {session_name}: {error_msg}"
+            )
+            return {
+                'joined': False,
+                'error': error_msg
+            }
+    
+    def get_monitoring_statistics(self, channel_id: Optional[str] = None) -> Dict:
+        """
+        Get aggregated monitoring statistics across all sessions
+        
+        Args:
+            channel_id: Optional channel ID to get stats for. If None, returns stats for all channels.
+            
+        Returns:
+            Dict with aggregated monitoring statistics (Requirement 4.3)
+        """
+        if channel_id:
+            # Get stats for specific channel across all sessions
+            total_reactions_sent = 0
+            total_messages_processed = 0
+            total_reaction_failures = 0
+            active_sessions = 0
+            
+            for session_name, session in self.sessions.items():
+                if session.is_connected:
+                    stats = session.get_monitoring_statistics(channel_id)
+                    if stats.get('monitoring_active', False):
+                        active_sessions += 1
+                        total_reactions_sent += stats.get('reactions_sent', 0)
+                        total_messages_processed += stats.get('messages_processed', 0)
+                        total_reaction_failures += stats.get('reaction_failures', 0)
+            
+            return {
+                'channel_id': channel_id,
+                'active_sessions': active_sessions,
+                'total_reactions_sent': total_reactions_sent,
+                'total_messages_processed': total_messages_processed,
+                'total_reaction_failures': total_reaction_failures
+            }
+        else:
+            # Get stats for all channels across all sessions
+            channel_stats = {}
+            
+            for session_name, session in self.sessions.items():
+                if session.is_connected:
+                    session_stats = session.get_monitoring_statistics()
+                    
+                    for ch_id, stats in session_stats.items():
+                        if ch_id not in channel_stats:
+                            channel_stats[ch_id] = {
+                                'active_sessions': 0,
+                                'total_reactions_sent': 0,
+                                'total_messages_processed': 0,
+                                'total_reaction_failures': 0
+                            }
+                        
+                        channel_stats[ch_id]['active_sessions'] += 1
+                        channel_stats[ch_id]['total_reactions_sent'] += stats.get('reactions_sent', 0)
+                        channel_stats[ch_id]['total_messages_processed'] += stats.get('messages_processed', 0)
+                        channel_stats[ch_id]['total_reaction_failures'] += stats.get('reaction_failures', 0)
+            
+            return channel_stats
+    
     def get_active_scrape_count(self) -> int:
         """
         Get the current number of active scraping operations (Task 6.1)

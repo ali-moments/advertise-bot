@@ -24,7 +24,7 @@ DAILY_MESSAGES_LIMIT = int(os.getenv('DAILY_MESSAGES_LIMIT', '500'))
 DAILY_GROUPS_LIMIT = int(os.getenv('DAILY_GROUPS_LIMIT', '10'))
 
 # Monitoring Settings
-MONITORING_COOLDOWN = float(os.getenv('MONITORING_COOLDOWN', '2.0'))
+MONITORING_COOLDOWN = float(os.getenv('MONITORING_COOLDOWN', '1.0'))
 MESSAGE_SCRAPING_DAYS = int(os.getenv('MESSAGE_SCRAPING_DAYS', '10'))
 
 # Blacklist Configuration
