@@ -1,0 +1,22 @@
+# Minimal Requirements for Production
+# Only the essential packages needed to run the bot
+# Install with: pip install -r requirements-minimal.txt
+
+# Core Telegram libraries
+python-telegram-bot==22.5
+Telethon==1.42.0
+
+# Configuration
+python-dotenv==1.2.1
+
+# Async I/O
+aiofiles==25.1.0
+
+# Scheduling
+APScheduler==3.11.1
+
+# HTTP client
+httpx==0.28.1
+
+# Note: Dependencies of the above packages will be
+# automatically installed by pip

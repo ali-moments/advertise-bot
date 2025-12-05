@@ -1,0 +1,38 @@
+[Unit]
+Description=Telegram Bot Control Panel
+After=network.target
+Documentation=https://github.com/your-repo/telegram-bot-panel
+
+[Service]
+Type=simple
+User=your_username
+Group=your_username
+WorkingDirectory=/path/to/telegram-bot-panel
+Environment="PATH=/path/to/telegram-bot-panel/venv/bin"
+EnvironmentFile=/path/to/telegram-bot-panel/.env
+
+# Start the bot
+ExecStart=/path/to/telegram-bot-panel/venv/bin/python panel/bot.py
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Resource limits
+MemoryLimit=4G
+CPUQuota=200%
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/path/to/telegram-bot-panel/logs /path/to/telegram-bot-panel/data /path/to/telegram-bot-panel/temp /path/to/telegram-bot-panel/.checkpoints
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegram-bot-panel
+
+[Install]
+WantedBy=multi-user.target

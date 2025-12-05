@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  telegram-bot-panel:
+    build: .
+    container_name: telegram-bot-panel
+    restart: unless-stopped
+    
+    # Environment variables from .env file
+    env_file:
+      - .env
+    
+    # Volume mounts for persistent data
+    volumes:
+      - ./sessions:/app/sessions
+      - ./logs:/app/logs
+      - ./data:/app/data
+      - ./temp:/app/temp
+      - ./.checkpoints:/app/.checkpoints
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('logs/bot.log') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
