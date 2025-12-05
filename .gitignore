@@ -42,6 +42,7 @@ data/
 sessions/data.db
 sessions/passwords.txt
 sessions/corrupted.csv
+sessions/blacklist.json
 
 # Testing
 .pytest_cache/
@@ -75,3 +76,7 @@ coverage.xml
 tests/*
 cli/config.minimal.json
 cli/config.json
+
+banger/*
+DOCUMENTATION_SUMMARY.md
+DOCUMENTATION_UPDATE_SUMMARY.md
