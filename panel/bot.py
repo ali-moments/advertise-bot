@@ -1,964 +1,883 @@
 """
-Telegram Bot Panel with Persian UI and Glass Buttons
+Telegram Bot Control Panel - Main Bot Class
+
+This module provides the main bot application that integrates all handlers
+and provides the primary interface for administrators to manage the Telegram
+session management system.
+
+Requirements: All requirements (main integration point)
 """
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from typing import Optional
 
-from telegram import (
-    Update, 
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton
-)
+from telegram import Update, BotCommand
 from telegram.ext import (
-    Application, 
-    CommandHandler, 
-    CallbackQueryHandler, 
-    MessageHandler, 
-    filters, 
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
     ConversationHandler
 )
 
-from telegram_manager.main import TelegramManagerApp
-from .config import (
-    ADMIN_USERS, 
-    BOT_TOKEN, 
-    PAGE_SIZE,
-    MAX_GROUPS_PER_BULK,
-    BOT_MAX_CONCURRENT_SCRAPES,
-    BOT_REQUEST_TIMEOUT
-)
-from .sending_handler import SendingHandler
-from .monitoring_handler import MonitoringHandler
-from .session_handler import SessionHandler
-from .scraping_handler import ScrapingHandler
-from .operation_history_handler import OperationHistoryHandler
+from telegram_manager.manager import TelegramSessionManager
+from .config import BOT_TOKEN, ADMIN_USERS
+from .auth import admin_only, format_admin_list
+from .state_manager import StateManager
+from .error_handler import BotErrorHandler, ErrorContext
+from .logging_config import get_logger
 from .keyboard_builder import KeyboardBuilder
 from .message_formatter import MessageFormatter
 from .navigation import get_navigation_manager
-from .state_manager import StateManager
-from .error_handler import BotErrorHandler
+from .rate_limiter import RateLimiter
+from .persian_text import (
+    MAIN_MENU_WELCOME,
+    HELP_MENU,
+    BTN_MAIN_MENU
+)
 
-# Conversation states
-SELECT_OPERATION, GET_GROUP_LINK, GET_CHANNEL_LINK, GET_BULK_LINKS, CONFIRM_OPERATION = range(5)
+# Import all handlers
+from .scraping_handler import ScrapingHandler
+from .sending_handler import SendingHandler
+from .monitoring_handler import MonitoringHandler
+from .session_handler import SessionHandler
+from .system_status_handler import SystemStatusHandler
+from .operation_history_handler import OperationHistoryHandler
+from .config_handler import ConfigurationHandler
+
 
 class TelegramBotPanel:
-    def __init__(self, session_manager: TelegramManagerApp):
+    """
+    Main Telegram Bot Control Panel Application
+    
+    This class integrates all handlers and provides the primary interface
+    for administrators to manage the Telegram session management system.
+    
+    Features:
+    - Admin authentication
+    - Command handlers (/start, /status, /admins, /help)
+    - Callback query routing
+    - Navigation system
+    - Global error handling
+    - Integration with all feature handlers
+    
+    Requirements:
+        - AC-6.6: Navigation system
+        - AC-8.1: Admin authentication
+        - AC-8.2: Admin list display
+        - AC-9.1, AC-9.2, AC-9.3, AC-9.4: Error handling
+        - AC-18.1: Help system
+    """
+    
+    def __init__(self, session_manager: TelegramSessionManager):
+        """
+        Initialize the Telegram Bot Panel
+        
+        Args:
+            session_manager: TelegramSessionManager instance for backend operations
+        """
         self.session_manager = session_manager
-        self.application = Application.builder().token(BOT_TOKEN).build()
-        self.logger = logging.getLogger("TelegramBotPanel")
+        self.logger = get_logger("TelegramBotPanel")
         
-        # User session data
-        self.user_sessions: Dict[int, Dict] = {}
-        
-        # Initialize navigation manager
-        self.nav_manager = get_navigation_manager()
-        
-        # Initialize state manager for operation tracking
+        # Initialize state manager
         self.state_manager = StateManager()
         
         # Initialize error handler
         self.error_handler = BotErrorHandler(logger_name="TelegramBotPanel")
         
-        # Initialize sending handler
-        self.sending_handler = SendingHandler(session_manager)
+        # Initialize navigation manager
+        self.navigation_manager = get_navigation_manager()
         
-        # Initialize monitoring handler
-        self.monitoring_handler = MonitoringHandler(session_manager)
+        # Initialize rate limiter
+        self.rate_limiter = RateLimiter()
         
-        # Initialize session handler
-        self.session_handler = SessionHandler(session_manager)
+        # Initialize all feature handlers
+        self.scraping_handler = ScrapingHandler(
+            session_manager=session_manager,
+            state_manager=self.state_manager,
+            error_handler=self.error_handler
+        )
         
-        # Initialize scraping handler
-        self.scraping_handler = ScrapingHandler(session_manager)
+        self.sending_handler = SendingHandler(
+            session_manager=session_manager,
+            state_manager=self.state_manager,
+            error_handler=self.error_handler
+        )
         
-        # Initialize operation history handler
-        self.operation_history_handler = OperationHistoryHandler(self.state_manager)
+        self.monitoring_handler = MonitoringHandler(
+            session_manager=session_manager,
+            state_manager=self.state_manager,
+            error_handler=self.error_handler
+        )
         
-        self.setup_handlers()
+        self.session_handler = SessionHandler(
+            session_manager=session_manager,
+            state_manager=self.state_manager,
+            error_handler=self.error_handler
+        )
+        
+        self.system_status_handler = SystemStatusHandler(
+            session_manager=session_manager
+        )
+        
+        self.operation_history_handler = OperationHistoryHandler(
+            state_manager=self.state_manager
+        )
+        
+        self.config_handler = ConfigurationHandler(
+            error_handler=self.error_handler
+        )
+        
+        # Application instance (will be created in setup)
+        self.application: Optional[Application] = None
+        
+        self.logger.info("TelegramBotPanel initialized")
     
-    def is_admin(self, user_id: int) -> bool:
-        """Check if user is admin"""
-        return user_id in ADMIN_USERS
-    
-    async def send_not_authorized(self, update: Update):
-        """Send not authorized message"""
-        message = """
-        ⚠️ **دسترسی محدود**
-        
-        شما دسترسی لازم برای استفاده از این ربات را ندارید.
+    async def setup(self) -> Application:
         """
-        await update.message.reply_text(message)
-    
-    def create_glass_keyboard(self, buttons: List[List[Dict]]) -> InlineKeyboardMarkup:
+        Set up the bot application with all handlers
+        
+        Returns:
+            Configured Application instance
         """
-        Create glass-style keyboard buttons
-        """
-        keyboard = []
-        for row in buttons:
-            keyboard_row = []
-            for button in row:
-                keyboard_row.append(
-                    InlineKeyboardButton(
-                        text=button['text'],
-                        callback_data=button['callback_data']
-                    )
-                )
-            keyboard.append(keyboard_row)
-        return InlineKeyboardMarkup(keyboard)
+        self.logger.info("Setting up bot application...")
+        
+        # Build application
+        self.application = (
+            ApplicationBuilder()
+            .token(BOT_TOKEN)
+            .build()
+        )
+        
+        # Set up handlers
+        self._setup_command_handlers()
+        self._setup_conversation_handlers()
+        self._setup_callback_handlers()
+        self._setup_error_handler()
+        
+        # Set bot commands for UI
+        await self._set_bot_commands()
+        
+        # Start cleanup tasks
+        await self.state_manager.start_cleanup_task()
+        await self.operation_history_handler.start_cleanup_task()
+        
+        self.logger.info("Bot application setup complete")
+        return self.application
     
-    def setup_handlers(self):
-        """Setup all bot handlers"""
-        # Command handlers
+    def _setup_command_handlers(self):
+        """
+        Set up command handlers for the bot
+        
+        Commands:
+        - /start: Show main menu
+        - /status: Show system status
+        - /admins: Show admin list
+        - /help: Show help menu
+        
+        Requirements: AC-8.2, AC-18.1
+        """
+        self.logger.info("Setting up command handlers...")
+        
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("admins", self.admins_command))
+        self.application.add_handler(CommandHandler("help", self.help_command))
         
-        # Add sending conversation handler
-        self.application.add_handler(self.sending_handler.get_conversation_handler())
+        self.logger.info("Command handlers registered")
+    
+    def _setup_conversation_handlers(self):
+        """
+        Set up conversation handlers for all features
         
-        # Add monitoring conversation handler
-        self.application.add_handler(self.monitoring_handler.get_conversation_handler())
+        Registers conversation handlers from:
+        - ScrapingHandler
+        - SendingHandler
+        - MonitoringHandler
+        - SessionHandler
+        - SystemStatusHandler
+        - OperationHistoryHandler
+        """
+        self.logger.info("Setting up conversation handlers...")
         
-        # Add session conversation handler
-        self.application.add_handler(self.session_handler.get_conversation_handler())
-        
-        # Add scraping conversation handler
+        # Add conversation handlers from each feature handler
         self.application.add_handler(self.scraping_handler.get_conversation_handler())
-        
-        # Add operation history conversation handler
+        self.application.add_handler(self.sending_handler.get_conversation_handler())
+        self.application.add_handler(self.monitoring_handler.get_conversation_handler())
+        self.application.add_handler(self.session_handler.get_conversation_handler())
+        self.application.add_handler(self.system_status_handler.get_conversation_handler())
         self.application.add_handler(self.operation_history_handler.get_conversation_handler())
+        self.application.add_handler(self.config_handler.get_conversation_handler())
         
-        # Conversation handler for operations
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler("scrape", self.scrape_command)],
-            states={
-                SELECT_OPERATION: [CallbackQueryHandler(self.select_operation, pattern='^(scrape_single|scrape_bulk|extract_links|monitor)$')],
-                GET_GROUP_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_group_link)],
-                GET_CHANNEL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_channel_link)],
-                GET_BULK_LINKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_bulk_links)],
-                CONFIRM_OPERATION: [CallbackQueryHandler(self.confirm_operation, pattern='^(confirm|cancel)$')],
-            },
-            fallbacks=[CommandHandler("cancel", self.cancel_operation)],
+        self.logger.info("Conversation handlers registered")
+    
+    def _setup_callback_handlers(self):
+        """
+        Set up callback query handlers for navigation and actions
+        
+        Handles:
+        - Navigation callbacks (nav:*)
+        - Action callbacks (action:*)
+        - Menu callbacks (menu:*)
+        
+        Requirements: AC-6.2, AC-6.6
+        """
+        self.logger.info("Setting up callback handlers...")
+        
+        # Navigation handlers
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_main_menu, pattern='^nav:main$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_back, pattern='^nav:back$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_cancel, pattern='^action:cancel$')
         )
         
-        self.application.add_handler(conv_handler)
+        # Menu handlers (fallback for direct menu access)
+        self.application.add_handler(
+            CallbackQueryHandler(self.show_scraping_menu, pattern='^menu:scraping$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.show_sending_menu, pattern='^menu:sending$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.show_monitoring_menu, pattern='^menu:monitoring$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.show_sessions_menu, pattern='^menu:sessions$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.show_settings_menu, pattern='^menu:settings$')
+        )
         
-        # Navigation callback handlers (must be before other handlers)
-        self.application.add_handler(CallbackQueryHandler(self.handle_navigation, pattern='^nav:'))
+        # Help handlers
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_help_main, pattern='^help:main$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_help_scraping, pattern='^help:scraping$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_help_sending, pattern='^help:sending$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_help_monitoring, pattern='^help:monitoring$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_help_sessions, pattern='^help:sessions$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_help_status, pattern='^help:status$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_help_history, pattern='^help:history$')
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_help_config, pattern='^help:config$')
+        )
         
-        # Callback query handlers
-        self.application.add_handler(CallbackQueryHandler(self.show_send_menu, pattern='^menu:sending$'))
-        self.application.add_handler(CallbackQueryHandler(self.button_handler, pattern='^(main_menu|system_status|nav:main)$'))
+        # Catch-all for unknown callbacks
+        self.application.add_handler(
+            CallbackQueryHandler(self.handle_unknown_callback)
+        )
         
-        # Error handler - use the global error handler from BotErrorHandler
-        self.application.add_error_handler(self.error_handler.global_error_handler)
+        self.logger.info("Callback handlers registered")
     
+    def _setup_error_handler(self):
+        """
+        Set up global error handler
+        
+        Requirements: AC-9.1, AC-9.2, AC-9.3, AC-9.4
+        """
+        self.logger.info("Setting up error handler...")
+        
+        self.application.add_error_handler(self.global_error_handler)
+        
+        self.logger.info("Error handler registered")
+    
+    async def _set_bot_commands(self):
+        """
+        Set bot commands for Telegram UI
+        
+        This makes commands visible in the Telegram command menu
+        """
+        commands = [
+            BotCommand("start", "شروع و نمایش منوی اصلی"),
+            BotCommand("status", "نمایش وضعیت سیستم"),
+            BotCommand("admins", "نمایش لیست ادمین‌ها"),
+            BotCommand("help", "راهنمای استفاده از ربات"),
+        ]
+        
+        try:
+            await self.application.bot.set_my_commands(commands)
+            self.logger.info("Bot commands set successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to set bot commands: {e}")
+    
+    # Command Handlers
+    
+    @admin_only
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        Start command with admin check
+        Handle /start command - Show main menu
         
-        Requirements: AC-9.1, AC-9.2, AC-9.3
+        Requirements: AC-6.1, AC-6.2, AC-8.1, AC-10.1
         """
-        try:
-            user_id = update.effective_user.id
-            
-            if not self.is_admin(user_id):
-                await self.send_not_authorized(update)
-                return
-            
-            welcome_message = """
-🌟 **به پنل مدیریت سشن‌های تلگرام خوش آمدید**
-
-**دسترسی‌های موجود:**
-🔹 مدیریت ۲۵۰ سشن فعال
-🔹 اسکرپ اعضای گروه‌ها
-🔹 استخراج لینک از کانال‌ها
-🔹 مانیتورینگ کانال‌ها
-
-**دستورات اصلی:**
-/scrape - شروع عملیات اسکرپ
-/status - وضعیت سیستم
-/admins - مشاهده ادمین‌ها
-
-برای شروع از دکمه‌های زیر استفاده کنید:
-"""
-            
-            keyboard = self.create_glass_keyboard([
-                [
-                    {"text": "🔍 اسکرپ اعضا", "callback_data": "scrape_menu"},
-                    {"text": "📤 ارسال پیام", "callback_data": "menu:sending"}
-                ],
-                [
-                    {"text": "👁️ مانیتورینگ", "callback_data": "monitor:menu"},
-                    {"text": "📊 وضعیت سیستم", "callback_data": "system_status"}
-                ],
-                [
-                    {"text": "👥 مدیریت سشن‌ها", "callback_data": "session:menu"},
-                    {"text": "🔄 منوی اصلی", "callback_data": "main_menu"}
-                ]
-            ])
-            
-            await update.message.reply_text(welcome_message, reply_markup=keyboard, parse_mode='Markdown')
-            
-        except Exception as e:
-            from .error_handler import ErrorContext
-            await self.error_handler.handle_error(
-                error=e,
-                update=update,
-                context=context,
-                error_context=ErrorContext(
-                    user_id=update.effective_user.id if update.effective_user else None,
-                    operation="start_command"
-                ),
-                retry_callback=None
-            )
-    
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        System status command - show comprehensive system statistics
+        user_id = update.effective_user.id
         
-        Requirements: AC-9.1, AC-9.2, AC-9.3, AC-9.5
-        """
-        try:
-            user_id = update.effective_user.id
-            
-            if not self.is_admin(user_id):
-                await self.send_not_authorized(update)
-                return
-            
-            # Get comprehensive system status
-            status_data = await self._get_system_status()
-            
-            # Format using MessageFormatter
-            status_message = MessageFormatter.format_system_status(status_data)
-            
-            # Create keyboard with refresh button
-            keyboard = KeyboardBuilder.refresh_back(
-                refresh_data="action:refresh_status",
-                back_data="nav:main"
-            )
-            
+        # Rate limiting
+        allowed = await self.rate_limiter.acquire(user_id, 'command', wait=True)
+        if not allowed:
             await update.message.reply_text(
-                status_message,
-                reply_markup=keyboard,
-                parse_mode='Markdown'
+                "⚠️ تعداد درخواست‌های شما زیاد است. لطفاً کمی صبر کنید."
             )
-            
-        except Exception as e:
-            from .error_handler import ErrorContext
-            await self.error_handler.handle_error(
-                error=e,
-                update=update,
-                context=context,
-                error_context=ErrorContext(
-                    user_id=update.effective_user.id if update.effective_user else None,
-                    operation="status_command"
-                ),
-                retry_callback="action:refresh_status"
-            )
-    
-    async def admins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Show admin list
-        
-        Requirements: AC-8.2, AC-9.1, AC-9.2, AC-9.3
-        """
-        try:
-            user_id = update.effective_user.id
-            
-            if not self.is_admin(user_id):
-                await self.send_not_authorized(update)
-                return
-            
-            admins_list = "\n".join([f"🔹 {admin_id}" for admin_id in ADMIN_USERS])
-            
-            message = f"""
-👥 **لیست ادمین‌های ربات**
-
-{admins_list}
-
-**تعداد کل:** {len(ADMIN_USERS)} ادمین
-"""
-            
-            await update.message.reply_text(message, parse_mode='Markdown')
-            
-        except Exception as e:
-            from .error_handler import ErrorContext
-            await self.error_handler.handle_error(
-                error=e,
-                update=update,
-                context=context,
-                error_context=ErrorContext(
-                    user_id=update.effective_user.id if update.effective_user else None,
-                    operation="admins_command"
-                ),
-                retry_callback=None
-            )
-    
-    async def scrape_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start scrape conversation"""
-        user_id = update.effective_user.id
-        
-        if not self.is_admin(user_id):
-            await self.send_not_authorized(update)
-            return ConversationHandler.END
-        
-        # Initialize user session
-        self.user_sessions[user_id] = {
-            'operation_type': None,
-            'targets': [],
-            'step': SELECT_OPERATION
-        }
-        
-        operation_message = """
-        🔍 **عملیات اسکرپ و استخراج**
-        
-        لطفاً نوع عملیات مورد نظر را انتخاب کنید:
-        
-        **گزینه‌های موجود:**
-        🔸 اسکرپ تک گروه - استخراج اعضای یک گروه
-        🔸 اسکرپ گروه‌های multiple - اسکرپ چندین گروه
-        🔸 استخراج لینک - استخراج لینک‌های گروه از کانال
-        🔸 مانیتورینگ - تنظیم مانیتورینگ کانال
-        """
-        
-        keyboard = self.create_glass_keyboard([
-            [
-                {"text": "🔸 اسکرپ تک گروه", "callback_data": "scrape_single"},
-                {"text": "🔸 اسکرپ چندگانه", "callback_data": "scrape_bulk"}
-            ],
-            [
-                {"text": "🔸 استخراج لینک", "callback_data": "extract_links"},
-                {"text": "🔸 مانیتورینگ", "callback_data": "monitor"}
-            ],
-            [
-                {"text": "❌ انصراف", "callback_data": "cancel"}
-            ]
-        ])
-        
-        await update.message.reply_text(operation_message, reply_markup=keyboard, parse_mode='Markdown')
-        
-        return SELECT_OPERATION
-    
-    async def select_operation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle operation selection"""
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        operation_type = query.data
-        
-        if not self.is_admin(user_id):
-            await query.edit_message_text("⚠️ دسترسی محدود")
-            return ConversationHandler.END
-        
-        self.user_sessions[user_id]['operation_type'] = operation_type
-        
-        if operation_type == 'scrape_single':
-            message = """
-            🔸 **اسکرپ تک گروه**
-            
-            لطفاً لینک گروه را ارسال کنید:
-            
-            **فرمت‌های قابل قبول:**
-            • https://t.me/groupname
-            • @groupname  
-            • https://t.me/+invitehash
-            
-            مثال: 
-            `https://t.me/+ABC123def456`
-            """
-            next_state = GET_GROUP_LINK
-            
-        elif operation_type == 'scrape_bulk':
-            message = """
-            🔸 **اسکرپ گروه‌های multiple**
-            
-            لطفاً لینک گروه‌ها را به صورت خط به خط ارسال کنید:
-            
-            **فرمت:**
-            ```
-            https://t.me/group1
-            @group2  
-            https://t.me/+invite1
-            https://t.me/group3
-            ```
-            
-            حداکثر ۱۰ گروه در هر درخواست
-            """
-            next_state = GET_BULK_LINKS
-            
-        elif operation_type == 'extract_links':
-            message = """
-            🔸 **استخراج لینک از کانال**
-            
-            لطفاً لینک کانال را ارسال کنید:
-            
-            **فرمت‌های قابل قبول:**
-            • https://t.me/channelname
-            • @channelname
-            
-            مثال:
-            `@linkdoni`
-            """
-            next_state = GET_CHANNEL_LINK
-            
-        elif operation_type == 'monitor':
-            message = """
-            🔸 **تنظیم مانیتورینگ**
-            
-            این قابلیت به زودی اضافه خواهد شد.
-            """
-            await query.edit_message_text(message)
-            return ConversationHandler.END
-        
-        else:
-            await query.edit_message_text("❌ عملیات نامعتبر")
-            return ConversationHandler.END
-        
-        keyboard = self.create_glass_keyboard([
-            [{"text": "❌ انصراف", "callback_data": "cancel"}]
-        ])
-        
-        await query.edit_message_text(message, reply_markup=keyboard, parse_mode='Markdown')
-        return next_state
-    
-    async def get_group_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Get single group link"""
-        user_id = update.effective_user.id
-        group_link = update.message.text.strip()
-        
-        if not self.is_admin(user_id):
-            await update.message.reply_text("⚠️ دسترسی محدود")
-            return ConversationHandler.END
-        
-        self.user_sessions[user_id]['targets'] = [group_link]
-        
-        confirm_message = f"""
-        ✅ **تأیید عملیات**
-        
-        **نوع عملیات:** اسکرپ تک گروه
-        **گروه هدف:** `{group_link}`
-        
-        آیا می‌خواهید عملیات شروع شود؟
-        """
-        
-        keyboard = self.create_glass_keyboard([
-            [
-                {"text": "✅ بله، شروع کن", "callback_data": "confirm"},
-                {"text": "❌ انصراف", "callback_data": "cancel"}
-            ]
-        ])
-        
-        await update.message.reply_text(confirm_message, reply_markup=keyboard, parse_mode='Markdown')
-        return CONFIRM_OPERATION
-    
-    async def get_bulk_links(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Get bulk group links"""
-        user_id = update.effective_user.id
-        links_text = update.message.text.strip()
-        
-        if not self.is_admin(user_id):
-            await update.message.reply_text("⚠️ دسترسی محدود")
-            return ConversationHandler.END
-        
-        # Parse links
-        links = [link.strip() for link in links_text.split('\n') if link.strip()]
-        links = links[:10]  # Limit to 10 groups
-        
-        self.user_sessions[user_id]['targets'] = links
-        
-        links_preview = "\n".join([f"• `{link}`" for link in links[:3]])
-        if len(links) > 3:
-            links_preview += f"\n• و {len(links) - 3} گروه دیگر..."
-        
-        confirm_message = f"""
-        ✅ **تأیید عملیات**
-        
-        **نوع عملیات:** اسکرپ گروه‌های multiple
-        **تعداد گروه‌ها:** {len(links)}
-        
-        **گروه‌ها:**
-        {links_preview}
-        
-        آیا می‌خواهید عملیات شروع شود؟
-        """
-        
-        keyboard = self.create_glass_keyboard([
-            [
-                {"text": "✅ بله، شروع کن", "callback_data": "confirm"},
-                {"text": "❌ انصراف", "callback_data": "cancel"}
-            ]
-        ])
-        
-        await update.message.reply_text(confirm_message, reply_markup=keyboard, parse_mode='Markdown')
-        return CONFIRM_OPERATION
-    
-    async def get_channel_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Get channel link for link extraction"""
-        user_id = update.effective_user.id
-        channel_link = update.message.text.strip()
-        
-        if not self.is_admin(user_id):
-            await update.message.reply_text("⚠️ دسترسی محدود")
-            return ConversationHandler.END
-        
-        self.user_sessions[user_id]['targets'] = [channel_link]
-        
-        confirm_message = f"""
-        ✅ **تأیید عملیات**
-        
-        **نوع عملیات:** استخراج لینک از کانال
-        **کانال هدف:** `{channel_link}`
-        
-        آیا می‌خواهید عملیات شروع شود؟
-        """
-        
-        keyboard = self.create_glass_keyboard([
-            [
-                {"text": "✅ بله، شروع کن", "callback_data": "confirm"},
-                {"text": "❌ انصراف", "callback_data": "cancel"}
-            ]
-        ])
-        
-        await update.message.reply_text(confirm_message, reply_markup=keyboard, parse_mode='Markdown')
-        return CONFIRM_OPERATION
-    
-    async def confirm_operation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Confirm and execute operation"""
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        action = query.data
-        
-        if not self.is_admin(user_id):
-            await query.edit_message_text("⚠️ دسترسی محدود")
-            return ConversationHandler.END
-        
-        if action == 'cancel':
-            await query.edit_message_text("❌ عملیات لغو شد")
-            return ConversationHandler.END
-        
-        user_session = self.user_sessions.get(user_id, {})
-        operation_type = user_session.get('operation_type')
-        targets = user_session.get('targets', [])
-        
-        # Show processing message
-        processing_message = """
-        ⏳ **در حال پردازش...**
-        
-        لطفاً چند لحظه صبر کنید.
-        """
-        await query.edit_message_text(processing_message, parse_mode='Markdown')
-        
-        try:
-            if operation_type == 'scrape_single':
-                result = await self.session_manager.scrape_group_members(targets[0], join_first=True)
-                
-                if result['success']:
-                    message = f"""
-                    ✅ **عملیات موفق**
-                    
-                    **گروه:** `{targets[0]}`
-                    **تعداد اعضا:** {result['members_count']}
-                    **فایل:** `{result.get('file_path', 'N/A')}`
-                    **منبع داده:** {result.get('source', 'N/A')}
-                    """
-                else:
-                    message = f"""
-                    ❌ **خطا در عملیات**
-                    
-                    **گروه:** `{targets[0]}`
-                    **خطا:** {result['error']}
-                    """
-            
-            elif operation_type == 'scrape_bulk':
-                results = await self.session_manager.bulk_scrape_groups(targets, join_first=True)
-                
-                success_count = sum(1 for r in results.values() if r.get('success'))
-                total_count = len(results)
-                
-                message = f"""
-                📊 **نتیجه اسکرپ گروه‌های multiple**
-                
-                **تعداد کل:** {total_count} گروه
-                **موفق:** {success_count} گروه
-                **ناموفق:** {total_count - success_count} گروه
-                
-                برای مشاهده جزئیات بیشتر از دستور /status استفاده کنید.
-                """
-            
-            elif operation_type == 'extract_links':
-                result = await self.session_manager.extract_group_links(targets[0])
-                
-                if result['success']:
-                    links_preview = "\n".join([f"• `{link}`" for link in result['telegram_links'][:5]])
-                    if len(result['telegram_links']) > 5:
-                        links_preview += f"\n• و {len(result['telegram_links']) - 5} لینک دیگر..."
-                    
-                    message = f"""
-                    ✅ **استخراج موفق**
-                    
-                    **کانال:** `{targets[0]}`
-                    **تعداد لینک‌ها:** {result['telegram_links_count']}
-                    
-                    **لینک‌های یافت شده:**
-                    {links_preview}
-                    """
-                else:
-                    message = f"""
-                    ❌ **خطا در استخراج**
-                    
-                    **کانال:** `{targets[0]}`
-                    **خطا:** {result['error']}
-                    """
-            
-            else:
-                message = "❌ عملیات نامعتبر"
-            
-        except Exception as e:
-            message = f"""
-            ❌ **خطای سیستمی**
-            
-            خطا در اجرای عملیات:
-            `{str(e)}`
-            """
-        
-        # Add navigation buttons
-        keyboard = self.create_glass_keyboard([
-            [{"text": "🔍 عملیات جدید", "callback_data": "scrape_menu"}],
-            [{"text": "🏠 منوی اصلی", "callback_data": "main_menu"}]
-        ])
-        
-        await query.edit_message_text(message, reply_markup=keyboard, parse_mode='Markdown')
-        return ConversationHandler.END
-    
-    async def cancel_operation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel operation"""
-        user_id = update.effective_user.id
-        if user_id in self.user_sessions:
-            del self.user_sessions[user_id]
-        
-        await update.message.reply_text("❌ عملیات لغو شد")
-        return ConversationHandler.END
-    
-    async def show_send_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show sending menu"""
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        
-        if not self.is_admin(user_id):
-            await query.edit_message_text("⚠️ دسترسی محدود")
             return
         
-        from .persian_text import SENDING_MENU_TEXT
+        self.logger.info(f"User {user_id} started bot")
         
-        keyboard = KeyboardBuilder.send_menu()
+        # Clear navigation state
+        self.navigation_manager.clear_state(user_id)
         
-        await query.edit_message_text(
-            SENDING_MENU_TEXT,
+        # Show main menu
+        keyboard = KeyboardBuilder.main_menu()
+        
+        await update.message.reply_text(
+            MAIN_MENU_WELCOME,
             reply_markup=keyboard,
             parse_mode='Markdown'
         )
     
-    async def handle_navigation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    @admin_only
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        Handle navigation callbacks (nav:*)
+        Handle /status command - Show system status
         
-        Provides consistent navigation behavior across all menus.
-        
-        Requirements: AC-6.6, AC-9.1, AC-9.2, AC-9.3
+        Requirements: AC-5.1, AC-5.2, AC-5.3, AC-5.4, AC-5.5, AC-5.6, AC-8.1, AC-10.1
         """
-        try:
-            query = update.callback_query
-            await query.answer()
-            
-            user_id = query.from_user.id
-            
-            if not self.is_admin(user_id):
-                await query.edit_message_text("⚠️ دسترسی محدود")
-                return
-            
-            action = query.data
-            
-            # Handle main menu navigation
-            if action == 'nav:main':
-                # Clear navigation state
-                self.nav_manager.clear_state(user_id)
-                
-                # Show main menu
-                welcome_message = """
-🌟 **به پنل مدیریت سشن‌های تلگرام خوش آمدید**
-
-**دسترسی‌های موجود:**
-🔹 مدیریت ۲۵۰ سشن فعال
-🔹 اسکرپ اعضای گروه‌ها
-🔹 ارسال پیام به کاربران
-🔹 مانیتورینگ کانال‌ها
-🔹 استخراج لینک از کانال‌ها
-
-برای شروع از دکمه‌های زیر استفاده کنید:
-"""
-                
-                keyboard = self.create_glass_keyboard([
-                    [
-                        {"text": "🔍 اسکرپ اعضا", "callback_data": "scrape_menu"},
-                        {"text": "📤 ارسال پیام", "callback_data": "menu:sending"}
-                    ],
-                    [
-                        {"text": "👁️ مانیتورینگ", "callback_data": "monitor:menu"},
-                        {"text": "📊 وضعیت سیستم", "callback_data": "system_status"}
-                    ],
-                    [
-                        {"text": "👥 مدیریت سشن‌ها", "callback_data": "session:menu"},
-                        {"text": "🔄 منوی اصلی", "callback_data": "main_menu"}
-                    ]
-                ])
-                
-                await query.edit_message_text(welcome_message, reply_markup=keyboard, parse_mode='Markdown')
-            
-            # Handle back navigation
-            elif action == 'nav:back':
-                # Pop navigation and go to previous menu
-                previous_target = self.nav_manager.pop_navigation(user_id)
-                if previous_target:
-                    # Trigger the previous menu callback
-                    query.data = previous_target
-                    await self.button_handler(update, context)
-                else:
-                    # No history, go to main menu
-                    query.data = 'nav:main'
-                    await self.handle_navigation(update, context)
-            
-            # Handle specific menu navigation
-            elif action == 'nav:scrape_menu':
-                self.nav_manager.push_navigation(user_id, "اسکرپ اعضا", "scrape_menu")
-                await self.scraping_handler.show_scrape_menu(update, context)
-            
-            elif action == 'nav:send_menu':
-                self.nav_manager.push_navigation(user_id, "ارسال پیام", "menu:sending")
-                await self.show_send_menu(update, context)
-            
-            elif action == 'nav:monitor_menu':
-                self.nav_manager.push_navigation(user_id, "مانیتورینگ", "monitor:menu")
-                await self.monitoring_handler.show_monitoring_menu(update, context)
-            
-            elif action == 'nav:session_menu':
-                self.nav_manager.push_navigation(user_id, "مدیریت سشن‌ها", "session:menu")
-                await self.session_handler.show_session_menu(update, context)
-            
-            # Handle no-op navigation (for pagination indicators)
-            elif action == 'nav:noop':
-                # Do nothing, just answer the callback
-                pass
-            
-            else:
-                # Unknown navigation action
-                self.logger.warning(f"Unknown navigation action: {action}")
+        user_id = update.effective_user.id
         
-        except Exception as e:
-            from .error_handler import ErrorContext
-            await self.error_handler.handle_error(
-                error=e,
-                update=update,
-                context=context,
-                error_context=ErrorContext(
-                    user_id=update.effective_user.id if update.effective_user else None,
-                    operation="handle_navigation",
-                    details={'action': query.data if 'query' in locals() else 'unknown'}
-                ),
-                retry_callback=None
+        # Rate limiting
+        allowed = await self.rate_limiter.acquire(user_id, 'command', wait=True)
+        if not allowed:
+            await update.message.reply_text(
+                "⚠️ تعداد درخواست‌های شما زیاد است. لطفاً کمی صبر کنید."
             )
+            return
+        
+        self.logger.info(f"User {user_id} requested system status")
+        
+        # Delegate to system status handler
+        await self.system_status_handler.show_system_status(update, context)
     
-    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle inline button clicks"""
+    @admin_only
+    async def admins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle /admins command - Show admin list
+        
+        Requirements: AC-8.2, AC-8.1
+        """
+        user_id = update.effective_user.id
+        self.logger.info(f"User {user_id} requested admin list")
+        
+        # Get formatted admin list
+        admin_list_text = format_admin_list()
+        
+        # Show with back to main menu button
+        keyboard = KeyboardBuilder.back_to_main()
+        
+        await update.message.reply_text(
+            admin_list_text,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    @admin_only
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle /help command - Show comprehensive help menu with navigation
+        
+        Requirements: AC-18.1, AC-18.2, AC-8.1
+        """
+        user_id = update.effective_user.id
+        self.logger.info(f"User {user_id} requested help")
+        
+        # Show help text with navigation to feature-specific help
+        keyboard = KeyboardBuilder.help_menu()
+        
+        await update.message.reply_text(
+            HELP_MENU,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    # Help Navigation Handlers
+    
+    @admin_only
+    async def handle_help_main(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle navigation back to main help menu
+        
+        Requirements: AC-18.1, AC-18.2
+        """
         query = update.callback_query
         await query.answer()
         
-        user_id = query.from_user.id
+        user_id = update.effective_user.id
+        self.logger.debug(f"User {user_id} navigating to main help")
         
-        if not self.is_admin(user_id):
-            await query.edit_message_text("⚠️ دسترسی محدود")
+        keyboard = KeyboardBuilder.help_menu()
+        
+        await query.edit_message_text(
+            HELP_MENU,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    @admin_only
+    async def handle_help_scraping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Show scraping operations help
+        
+        Requirements: AC-18.2
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        self.logger.debug(f"User {user_id} viewing scraping help")
+        
+        from .persian_text import HELP_SCRAPING
+        keyboard = KeyboardBuilder.help_feature_back()
+        
+        await query.edit_message_text(
+            HELP_SCRAPING,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    @admin_only
+    async def handle_help_sending(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Show message sending help
+        
+        Requirements: AC-18.2
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        self.logger.debug(f"User {user_id} viewing sending help")
+        
+        from .persian_text import HELP_SENDING
+        keyboard = KeyboardBuilder.help_feature_back()
+        
+        await query.edit_message_text(
+            HELP_SENDING,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    @admin_only
+    async def handle_help_monitoring(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Show monitoring help
+        
+        Requirements: AC-18.2
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        self.logger.debug(f"User {user_id} viewing monitoring help")
+        
+        from .persian_text import HELP_MONITORING
+        keyboard = KeyboardBuilder.help_feature_back()
+        
+        await query.edit_message_text(
+            HELP_MONITORING,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    @admin_only
+    async def handle_help_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Show session management help
+        
+        Requirements: AC-18.2
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        self.logger.debug(f"User {user_id} viewing sessions help")
+        
+        from .persian_text import HELP_SESSIONS
+        keyboard = KeyboardBuilder.help_feature_back()
+        
+        await query.edit_message_text(
+            HELP_SESSIONS,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    @admin_only
+    async def handle_help_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Show system status help
+        
+        Requirements: AC-18.2
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        self.logger.debug(f"User {user_id} viewing status help")
+        
+        from .persian_text import HELP_SYSTEM_STATUS
+        keyboard = KeyboardBuilder.help_feature_back()
+        
+        await query.edit_message_text(
+            HELP_SYSTEM_STATUS,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    @admin_only
+    async def handle_help_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Show operation history help
+        
+        Requirements: AC-18.2
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        self.logger.debug(f"User {user_id} viewing history help")
+        
+        from .persian_text import HELP_OPERATION_HISTORY
+        keyboard = KeyboardBuilder.help_feature_back()
+        
+        await query.edit_message_text(
+            HELP_OPERATION_HISTORY,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    @admin_only
+    async def handle_help_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Show configuration help
+        
+        Requirements: AC-18.2
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        self.logger.debug(f"User {user_id} viewing config help")
+        
+        from .persian_text import HELP_CONFIGURATION
+        keyboard = KeyboardBuilder.help_feature_back()
+        
+        await query.edit_message_text(
+            HELP_CONFIGURATION,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    # Navigation Handlers
+    
+    @admin_only
+    async def handle_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle navigation to main menu
+        
+        Requirements: AC-6.6, AC-10.2
+        """
+        query = update.callback_query
+        user_id = update.effective_user.id
+        
+        # Rate limiting for button clicks
+        allowed = await self.rate_limiter.acquire(user_id, 'button', wait=False)
+        if not allowed:
+            await query.answer("⚠️ لطفاً کمی صبر کنید", show_alert=True)
             return
         
-        action = query.data
+        await query.answer()
         
-        if action == 'main_menu' or action == 'nav:main':
-            # Show main menu
-            welcome_message = """
-🌟 **به پنل مدیریت سشن‌های تلگرام خوش آمدید**
+        self.logger.debug(f"User {user_id} navigating to main menu")
+        
+        # Clear navigation state
+        self.navigation_manager.clear_state(user_id)
+        
+        # Show main menu
+        keyboard = KeyboardBuilder.main_menu()
+        
+        await query.edit_message_text(
+            MAIN_MENU_WELCOME,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    @admin_only
+    async def handle_back(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle back button navigation
+        
+        Requirements: AC-6.6
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        self.logger.debug(f"User {user_id} pressed back button")
+        
+        # Pop navigation and get previous target
+        previous_target = self.navigation_manager.pop_navigation(user_id)
+        
+        if previous_target:
+            # Navigate to previous target
+            # Create a new callback query with the previous target
+            query.data = previous_target
+            await self.route_callback(update, context)
+        else:
+            # No history, go to main menu
+            await self.handle_main_menu(update, context)
+    
+    @admin_only
+    async def handle_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle cancel button - return to main menu
+        
+        Requirements: AC-6.6
+        """
+        query = update.callback_query
+        await query.answer("❌ عملیات لغو شد")
+        
+        user_id = update.effective_user.id
+        self.logger.info(f"User {user_id} cancelled operation")
+        
+        # Clear user session
+        self.state_manager.delete_user_session(user_id)
+        
+        # Return to main menu
+        await self.handle_main_menu(update, context)
+        
+        return ConversationHandler.END
+    
+    # Menu Handlers
+    
+    @admin_only
+    async def show_scraping_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show scraping menu"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        
+        # Delegate to scraping handler
+        await self.scraping_handler.show_scrape_menu(update, context)
+    
+    @admin_only
+    async def show_sending_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show sending menu"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        
+        # Delegate to sending handler
+        await self.sending_handler.show_send_menu(update, context)
+    
+    @admin_only
+    async def show_monitoring_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show monitoring menu"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        
+        # Delegate to monitoring handler
+        await self.monitoring_handler.show_monitoring_menu(update, context)
+    
+    @admin_only
+    async def show_sessions_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show sessions menu"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        
+        # Delegate to session handler
+        await self.session_handler.show_session_menu(update, context)
+    
+    @admin_only
+    async def show_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Show settings menu - delegates to ConfigurationHandler
+        
+        Requirements: AC-16.1
+        """
+        # Delegate to configuration handler
+        await self.config_handler.show_config(update, context)
+    
+    @admin_only
+    async def handle_unknown_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle unknown callback queries gracefully
+        
+        Requirements: AC-6.2
+        """
+        query = update.callback_query
+        await query.answer("⚠️ دستور نامعتبر")
+        
+        user_id = update.effective_user.id
+        callback_data = query.data
+        
+        self.logger.warning(f"Unknown callback from user {user_id}: {callback_data}")
+        
+        # Show error message with option to return to main menu
+        text = """
+⚠️ **دستور نامعتبر**
 
-**دسترسی‌های موجود:**
-🔹 مدیریت ۲۵۰ سشن فعال
-🔹 اسکرپ اعضای گروه‌ها
-🔹 ارسال پیام به کاربران
-🔹 مانیتورینگ کانال‌ها
-🔹 استخراج لینک از کانال‌ها
+دستور درخواستی شناخته نشده است.
 
-برای شروع از دکمه‌های زیر استفاده کنید:
+لطفاً از منوی اصلی استفاده کنید.
 """
-            
-            keyboard = self.create_glass_keyboard([
-                [
-                    {"text": "🔍 اسکرپ اعضا", "callback_data": "scrape_menu"},
-                    {"text": "📤 ارسال پیام", "callback_data": "menu:sending"}
-                ],
-                [
-                    {"text": "👁️ مانیتورینگ", "callback_data": "monitor:menu"},
-                    {"text": "📊 وضعیت سیستم", "callback_data": "system_status"}
-                ],
-                [
-                    {"text": "👥 مدیریت سشن‌ها", "callback_data": "session:menu"},
-                    {"text": "📜 تاریخچه عملیات", "callback_data": "operation:history:page:0"}
-                ]
-            ])
-            
-            await query.edit_message_text(welcome_message, reply_markup=keyboard, parse_mode='Markdown')
-        elif action == 'system_status' or action == 'action:refresh_status':
-            # Show or refresh system status
-            await self._show_system_status(query)
-        elif action == 'scrape_menu':
-            await self.scrape_command(update, context)
-    
-    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle errors"""
-        self.logger.error(f"Bot error: {context.error}")
         
-        if update and update.effective_message:
-            try:
-                await update.effective_message.reply_text(
-                    "❌ خطای سیستمی رخ داد. لطفاً دوباره تلاش کنید."
-                )
-            except:
-                pass
-    
-    async def _get_system_status(self) -> Dict:
-        """
-        Get comprehensive system status data
+        keyboard = KeyboardBuilder.back_to_main()
         
-        Returns:
-            Dict with all system statistics
-            
-        Requirements: AC-5.1, AC-5.2, AC-5.3, AC-5.4, AC-5.5
-        """
         try:
-            # Get session stats
-            stats = await self.session_manager.get_session_stats()
-            
-            # Calculate session statistics
-            total_sessions = len(stats)
-            connected_sessions = sum(1 for s in stats.values() if s.get('connected', False))
-            monitoring_sessions = sum(1 for s in stats.values() if s.get('monitoring', False))
-            
-            # Calculate active operations
-            active_scrapes = sum(
-                1 for s in stats.values() 
-                if s.get('current_operation') == 'scraping'
-            )
-            active_sends = sum(
-                1 for s in stats.values() 
-                if s.get('current_operation') == 'sending'
-            )
-            active_monitoring = monitoring_sessions
-            
-            # Calculate today's statistics
-            messages_read = sum(
-                s.get('daily_stats', {}).get('messages_read', 0) 
-                for s in stats.values()
-            )
-            groups_scraped = sum(
-                s.get('daily_stats', {}).get('groups_scraped_today', 0) 
-                for s in stats.values()
-            )
-            messages_sent = 0  # TODO: Add when sending tracking is implemented
-            
-            # Get monitoring statistics
-            monitoring_targets = getattr(self.session_manager, 'monitoring_targets', [])
-            active_channels = len([
-                t for t in monitoring_targets 
-                if (isinstance(t, dict) and t.get('enabled', True)) or 
-                   (hasattr(t, 'enabled') and t.enabled)
-            ])
-            
-            # Calculate reactions sent today (from monitoring stats)
-            reactions_sent = 0
-            reactions_today = 0
-            # TODO: Add reaction tracking when monitoring stats are available
-            
-            return {
-                'total_sessions': total_sessions,
-                'connected_sessions': connected_sessions,
-                'monitoring_sessions': monitoring_sessions,
-                'active_scrapes': active_scrapes,
-                'active_sends': active_sends,
-                'active_monitoring': active_monitoring,
-                'messages_read': messages_read,
-                'groups_scraped': groups_scraped,
-                'messages_sent': messages_sent,
-                'reactions_sent': reactions_sent,
-                'active_channels': active_channels,
-                'reactions_today': reactions_today
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error getting system status: {e}")
-            # Return empty stats on error
-            return {
-                'total_sessions': 0,
-                'connected_sessions': 0,
-                'monitoring_sessions': 0,
-                'active_scrapes': 0,
-                'active_sends': 0,
-                'active_monitoring': 0,
-                'messages_read': 0,
-                'groups_scraped': 0,
-                'messages_sent': 0,
-                'reactions_sent': 0,
-                'active_channels': 0,
-                'reactions_today': 0
-            }
-    
-    async def _show_system_status(self, query):
-        """
-        Show system status in response to callback query
-        
-        Args:
-            query: CallbackQuery object
-            
-        Requirements: AC-5.6
-        """
-        try:
-            # Get comprehensive system status
-            status_data = await self._get_system_status()
-            
-            # Format using MessageFormatter
-            status_message = MessageFormatter.format_system_status(status_data)
-            
-            # Create keyboard with refresh button
-            keyboard = KeyboardBuilder.refresh_back(
-                refresh_data="action:refresh_status",
-                back_data="nav:main"
-            )
-            
             await query.edit_message_text(
-                status_message,
+                text,
                 reply_markup=keyboard,
                 parse_mode='Markdown'
             )
-            
         except Exception as e:
-            self.logger.error(f"Error showing system status: {e}")
-            await query.edit_message_text(f"❌ خطا در دریافت وضعیت: {str(e)}")
+            self.logger.error(f"Failed to edit message for unknown callback: {e}")
+    
+    async def route_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Route callback queries to appropriate handlers
+        
+        This is a helper method for programmatic callback routing
+        """
+        query = update.callback_query
+        callback_data = query.data
+        
+        # Route based on callback prefix
+        if callback_data.startswith('nav:main'):
+            await self.handle_main_menu(update, context)
+        elif callback_data.startswith('menu:scraping'):
+            await self.show_scraping_menu(update, context)
+        elif callback_data.startswith('menu:sending'):
+            await self.show_sending_menu(update, context)
+        elif callback_data.startswith('menu:monitoring'):
+            await self.show_monitoring_menu(update, context)
+        elif callback_data.startswith('menu:sessions'):
+            await self.show_sessions_menu(update, context)
+        elif callback_data.startswith('menu:settings'):
+            await self.show_settings_menu(update, context)
+        else:
+            await self.handle_unknown_callback(update, context)
+    
+    # Error Handler
+    
+    async def global_error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Global error handler for all bot errors
+        
+        Requirements: AC-9.1, AC-9.2, AC-9.3, AC-9.4
+        """
+        # Get error
+        error = context.error
+        
+        # Log error
+        self.logger.error(f"Global error handler caught: {error}", exc_info=error)
+        
+        # Get user ID if available
+        user_id = None
+        if isinstance(update, Update):
+            if update.effective_user:
+                user_id = update.effective_user.id
+        
+        # Create error context
+        error_context = ErrorContext(
+            user_id=user_id,
+            operation="global",
+            details={"update": str(update) if update else "No update"}
+        )
+        
+        # Handle error using error handler
+        if isinstance(update, Update):
+            await self.error_handler.handle_error(
+                error=error,
+                update=update,
+                context=context,
+                error_context=error_context
+            )
+        else:
+            # Log only if update is not available
+            self.error_handler.log_error(error, error_context.__dict__)
+    
+    # Application Lifecycle
     
     async def run(self):
-        """Start the bot"""
-        await self.application.run_polling()
+        """
+        Run the bot application
+        
+        This method starts the bot and runs it until stopped.
+        """
+        self.logger.info("Starting Telegram Bot Panel...")
+        
+        # Set up application
+        await self.setup()
+        
+        # Start polling
+        self.logger.info("Bot is now running. Press Ctrl+C to stop.")
+        await self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    async def shutdown(self):
+        """
+        Gracefully shutdown the bot application
+        """
+        self.logger.info("Shutting down Telegram Bot Panel...")
+        
+        # Stop cleanup tasks
+        await self.state_manager.stop_cleanup_task()
+        await self.operation_history_handler.stop_cleanup_task()
+        
+        # Stop application
+        if self.application:
+            await self.application.stop()
+        
+        self.logger.info("Bot shutdown complete")
+
+
+async def main():
+    """
+    Main entry point for the bot application
+    """
+    # Initialize session manager (placeholder - should be passed from main app)
+    from telegram_manager.manager import TelegramSessionManager
+    session_manager = TelegramSessionManager()
+    
+    # Create and run bot
+    bot = TelegramBotPanel(session_manager)
+    
+    try:
+        await bot.run()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        await bot.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -14,7 +14,9 @@ from .persian_text import (
     BTN_LIST_CHANNELS, BTN_ADD_CHANNEL, BTN_REMOVE_CHANNEL, BTN_EDIT_REACTIONS,
     BTN_EDIT_COOLDOWN, BTN_START_MONITORING, BTN_STOP_MONITORING, BTN_MONITORING_STATS,
     BTN_LIST_SESSIONS, BTN_SESSION_DETAILS, BTN_DAILY_STATS, BTN_HEALTH_STATUS,
-    BTN_LOAD_DISTRIBUTION
+    BTN_LOAD_DISTRIBUTION,
+    BTN_HELP_SCRAPING, BTN_HELP_SENDING, BTN_HELP_MONITORING, BTN_HELP_SESSIONS,
+    BTN_HELP_STATUS, BTN_HELP_HISTORY, BTN_HELP_CONFIG, BTN_BACK_TO_HELP
 )
 from .navigation import get_navigation_manager
 
@@ -735,6 +737,52 @@ class KeyboardBuilder:
             ],
             [
                 InlineKeyboardButton(BTN_BACK, callback_data=f"operation:history:page:{page}"),
+                InlineKeyboardButton(BTN_MAIN_MENU, callback_data="nav:main")
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
+    def help_menu() -> InlineKeyboardMarkup:
+        """
+        Build help menu keyboard with navigation to feature-specific help
+        
+        Requirements: AC-18.1, AC-18.2
+        """
+        keyboard = [
+            [
+                InlineKeyboardButton(BTN_HELP_SCRAPING, callback_data="help:scraping"),
+                InlineKeyboardButton(BTN_HELP_SENDING, callback_data="help:sending")
+            ],
+            [
+                InlineKeyboardButton(BTN_HELP_MONITORING, callback_data="help:monitoring"),
+                InlineKeyboardButton(BTN_HELP_SESSIONS, callback_data="help:sessions")
+            ],
+            [
+                InlineKeyboardButton(BTN_HELP_STATUS, callback_data="help:status"),
+                InlineKeyboardButton(BTN_HELP_HISTORY, callback_data="help:history")
+            ],
+            [
+                InlineKeyboardButton(BTN_HELP_CONFIG, callback_data="help:config")
+            ],
+            [
+                InlineKeyboardButton(BTN_MAIN_MENU, callback_data="nav:main")
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
+    def help_feature_back() -> InlineKeyboardMarkup:
+        """
+        Build back button for feature-specific help pages
+        
+        Requirements: AC-18.2
+        """
+        keyboard = [
+            [
+                InlineKeyboardButton(BTN_BACK_TO_HELP, callback_data="help:main")
+            ],
+            [
                 InlineKeyboardButton(BTN_MAIN_MENU, callback_data="nav:main")
             ]
         ]

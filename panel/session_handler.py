@@ -1,472 +1,733 @@
 """
-SessionHandler - Handles session management operations
+Session Handler - Manages session display and statistics through bot interface
+
+This module handles:
+- Session list display with pagination
+- Session details view
+- Daily usage statistics
+- Session health status display
+- Load distribution visualization
+
+Requirements: AC-4.1, AC-4.2, AC-4.3, AC-4.4, AC-4.5, AC-4.6
 """
 
 import asyncio
-import time
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field
+import logging
+from typing import Optional, List, Dict, Any
 from datetime import datetime
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ContextTypes,
     ConversationHandler,
-    CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
     filters
 )
 
-from telegram_manager.main import TelegramManagerApp
+from telegram_manager.manager import TelegramSessionManager
+from .state_manager import StateManager
 from .keyboard_builder import KeyboardBuilder
 from .message_formatter import MessageFormatter
+from .error_handler import BotErrorHandler, ErrorContext
 from .persian_text import (
-    OPERATION_CANCELLED, PLEASE_WAIT, ERROR_TEMPLATE,
-    SESSION_LIST_HEADER, SESSION_DETAILS_HEADER, LOAD_DISTRIBUTION_HEADER
+    SESSION_MENU_TEXT, BTN_LIST_SESSIONS, BTN_SESSION_DETAILS,
+    BTN_DAILY_STATS, BTN_HEALTH_STATUS, BTN_LOAD_DISTRIBUTION,
+    STATUS_CONNECTED, STATUS_DISCONNECTED, STATUS_ACTIVE, STATUS_INACTIVE
 )
 
 
 # Conversation states
-(
-    SELECT_SESSION_ACTION,
-    SELECT_SESSION,
-    VIEW_SESSION_DETAILS
-) = range(3)
-
-
-@dataclass
-class SessionUserSession:
-    """User session data for session management operations"""
-    user_id: int
-    action: str  # 'list', 'details', 'load_distribution'
-    selected_session: Optional[str] = None
-    page: int = 0  # For pagination
-    started_at: float = field(default_factory=time.time)
+SELECT_SESSION_ACTION = 0
+VIEW_SESSION_DETAILS = 1
 
 
 class SessionHandler:
-    """Handle session management operations"""
+    """
+    Handler for all session management operations
     
-    def __init__(self, session_manager: TelegramManagerApp):
+    Manages:
+    - Displaying session list with pagination
+    - Showing detailed session information
+    - Displaying daily usage statistics
+    - Showing session health status
+    - Visualizing load distribution
+    
+    Requirements: AC-4.1 through AC-4.6
+    """
+    
+    # Pagination settings
+    SESSIONS_PER_PAGE = 5
+    
+    def __init__(
+        self,
+        session_manager: TelegramSessionManager,
+        state_manager: StateManager,
+        error_handler: BotErrorHandler
+    ):
         """
         Initialize session handler
         
         Args:
-            session_manager: TelegramManagerApp instance
+            session_manager: TelegramSessionManager instance
+            state_manager: StateManager instance
+            error_handler: BotErrorHandler instance
         """
         self.session_manager = session_manager
-        self.user_sessions: Dict[int, SessionUserSession] = {}
-        self.sessions_per_page = 10  # AC-4.1 requirement
+        self.state_manager = state_manager
+        self.error_handler = error_handler
+        self.logger = logging.getLogger("SessionHandler")
+        
+        self.logger.info("SessionHandler initialized")
     
     def get_conversation_handler(self) -> ConversationHandler:
         """
-        Get the conversation handler for session management
+        Get conversation handler for session operations
         
         Returns:
-            ConversationHandler configured for session operations
+            ConversationHandler configured for session flows
         """
         return ConversationHandler(
             entry_points=[
-                CallbackQueryHandler(self.show_session_menu, pattern='^session:menu$'),
-                CallbackQueryHandler(self.show_session_list, pattern='^session:list$'),
-                CallbackQueryHandler(self.show_load_distribution, pattern='^session:load_distribution$'),
+                CallbackQueryHandler(self.show_session_menu, pattern='^menu:sessions$'),
+                CallbackQueryHandler(self.list_sessions, pattern='^session:list'),
+                CallbackQueryHandler(self.show_daily_stats, pattern='^session:daily_stats$'),
+                CallbackQueryHandler(self.show_health_status, pattern='^session:health$'),
+                CallbackQueryHandler(self.show_load_distribution, pattern='^session:load$'),
             ],
             states={
                 SELECT_SESSION_ACTION: [
-                    CallbackQueryHandler(self.show_session_list, pattern='^session:list$'),
-                    CallbackQueryHandler(self.show_load_distribution, pattern='^session:load_distribution$'),
-                    CallbackQueryHandler(self.cancel_operation, pattern='^session:cancel$'),
-                ],
-                SELECT_SESSION: [
+                    CallbackQueryHandler(self.list_sessions, pattern='^session:list'),
+                    CallbackQueryHandler(self.show_daily_stats, pattern='^session:daily_stats$'),
+                    CallbackQueryHandler(self.show_health_status, pattern='^session:health$'),
+                    CallbackQueryHandler(self.show_load_distribution, pattern='^session:load$'),
                     CallbackQueryHandler(self.show_session_details, pattern='^session:details:'),
-                    CallbackQueryHandler(self.show_session_list, pattern='^session:list:page:'),
-                    CallbackQueryHandler(self.cancel_operation, pattern='^session:cancel$'),
+                    CallbackQueryHandler(self.refresh_session_details, pattern='^session:refresh:'),
                 ],
                 VIEW_SESSION_DETAILS: [
-                    CallbackQueryHandler(self.show_session_list, pattern='^session:back_to_list$'),
                     CallbackQueryHandler(self.refresh_session_details, pattern='^session:refresh:'),
-                    CallbackQueryHandler(self.cancel_operation, pattern='^session:cancel$'),
+                    CallbackQueryHandler(self.list_sessions, pattern='^session:back_to_list$'),
                 ],
             },
             fallbacks=[
-                CommandHandler('cancel', self.cancel_operation),
-                CallbackQueryHandler(self.cancel_operation, pattern='^nav:main$'),
+                CallbackQueryHandler(self.cancel_operation, pattern='^action:cancel$'),
+                CallbackQueryHandler(self.show_session_menu, pattern='^session:menu$'),
+                CallbackQueryHandler(self.list_sessions, pattern='^session:back_to_list$'),
             ],
-            name="session_management",
+            name="session_conversation",
             persistent=False
         )
     
     async def show_session_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """
-        Show session management menu
+        Show session management menu with operation options
         
         Requirements: AC-4.1
         """
         query = update.callback_query
-        await query.answer()
+        if query:
+            await query.answer()
         
-        user_id = query.from_user.id
+        user_id = update.effective_user.id
         
-        # Initialize user session
-        self.user_sessions[user_id] = SessionUserSession(
+        # Create or update user session
+        self.state_manager.create_user_session(
             user_id=user_id,
-            action='menu'
+            operation='session_management',
+            step='menu'
         )
         
-        message = """
-👥 **مدیریت سشن‌ها**
-
-از این بخش می‌توانید:
-🔹 لیست تمام سشن‌ها را مشاهده کنید
-🔹 جزئیات هر سشن را ببینید
-🔹 توزیع بار را بررسی کنید
-🔹 وضعیت سلامت سشن‌ها را چک کنید
-
-لطفاً یک گزینه را انتخاب کنید:
-"""
+        # Build keyboard
+        keyboard = KeyboardBuilder.session_menu(user_id=user_id)
         
-        keyboard = KeyboardBuilder.session_menu()
+        # Send or edit message
+        if query:
+            await query.edit_message_text(
+                text=SESSION_MENU_TEXT,
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                text=SESSION_MENU_TEXT,
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+        
+        return SELECT_SESSION_ACTION
+    
+    async def list_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0) -> int:
+        """
+        Display list of sessions with pagination
+        
+        Requirements: AC-4.1, AC-6.7
+        """
+        query = update.callback_query
+        if query:
+            await query.answer()
+        
+        # Extract page from callback data if present
+        if query and 'page:' in query.data:
+            page = int(query.data.split(':')[-1])
+        
+        # Get all sessions
+        all_sessions = await self._get_all_sessions()
+        
+        # Calculate pagination
+        total_sessions = len(all_sessions)
+        total_pages = (total_sessions + self.SESSIONS_PER_PAGE - 1) // self.SESSIONS_PER_PAGE
+        total_pages = max(1, total_pages)
+        page = max(0, min(page, total_pages - 1))
+        
+        # Get sessions for current page
+        start_idx = page * self.SESSIONS_PER_PAGE
+        end_idx = start_idx + self.SESSIONS_PER_PAGE
+        page_sessions = all_sessions[start_idx:end_idx]
+        
+        # Format session list
+        message_text = MessageFormatter.format_session_list(
+            sessions=page_sessions,
+            page=page + 1,
+            total_pages=total_pages
+        )
+        
+        # Build keyboard with session buttons
+        keyboard = KeyboardBuilder.session_list(
+            sessions=page_sessions,
+            page=page,
+            total_pages=total_pages
+        )
+        
+        # Send or edit message
+        if query:
+            await query.edit_message_text(
+                text=message_text,
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                text=message_text,
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+        
+        return SELECT_SESSION_ACTION
+    
+    async def show_session_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """
+        Show detailed information for a specific session
+        
+        Requirements: AC-4.2
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        # Extract session name from callback data
+        session_name = query.data.split(':', 2)[-1]
+        
+        # Get session details
+        session_stats = await self._get_session_details(session_name)
+        
+        if not session_stats:
+            await query.edit_message_text(
+                text="❌ سشن یافت نشد.",
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
+        
+        # Format session details
+        message_text = MessageFormatter.format_session_stats(session_stats)
+        
+        # Build keyboard with refresh and back buttons
+        keyboard = KeyboardBuilder.session_details(session_name)
         
         await query.edit_message_text(
-            message,
+            text=message_text,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        
+        return VIEW_SESSION_DETAILS
+    
+    async def refresh_session_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """
+        Refresh session details display
+        
+        Requirements: AC-4.2, AC-10.1
+        """
+        query = update.callback_query
+        await query.answer("🔄 در حال بروزرسانی...")
+        
+        # Extract session name from callback data
+        session_name = query.data.split(':', 2)[-1]
+        
+        # Get updated session details
+        session_stats = await self._get_session_details(session_name)
+        
+        if not session_stats:
+            await query.edit_message_text(
+                text="❌ سشن یافت نشد.",
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
+        
+        # Format session details
+        message_text = MessageFormatter.format_session_stats(session_stats)
+        
+        # Build keyboard with refresh and back buttons
+        keyboard = KeyboardBuilder.session_details(session_name)
+        
+        await query.edit_message_text(
+            text=message_text,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        
+        return VIEW_SESSION_DETAILS
+    
+    async def show_daily_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """
+        Display daily usage statistics for all sessions
+        
+        Requirements: AC-4.3
+        """
+        query = update.callback_query
+        await query.answer()
+        
+        # Get daily statistics
+        daily_stats = await self._get_daily_statistics()
+        
+        # Format statistics message
+        message_text = self._format_daily_statistics(daily_stats)
+        
+        # Build keyboard
+        keyboard = KeyboardBuilder.back_to_session_menu()
+        
+        await query.edit_message_text(
+            text=message_text,
             reply_markup=keyboard,
             parse_mode='Markdown'
         )
         
         return SELECT_SESSION_ACTION
     
-    async def show_session_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    async def show_health_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """
-        Show paginated list of sessions with status indicators
+        Display health status for all sessions
         
-        Requirements: AC-4.1, AC-4.2, AC-4.3
-        """
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        
-        # Parse page number from callback data
-        page = 0
-        if ':page:' in query.data:
-            try:
-                page = int(query.data.split(':page:')[1])
-            except (IndexError, ValueError):
-                page = 0
-        
-        # Update user session
-        if user_id not in self.user_sessions:
-            self.user_sessions[user_id] = SessionUserSession(
-                user_id=user_id,
-                action='list'
-            )
-        self.user_sessions[user_id].action = 'list'
-        self.user_sessions[user_id].page = page
-        
-        # Show loading message
-        await query.edit_message_text(PLEASE_WAIT, parse_mode='Markdown')
-        
-        try:
-            # Get session statistics
-            stats = await self.session_manager.get_session_stats()
-            
-            if not stats:
-                message = "👥 **لیست سشن‌ها**\n\nهیچ سشنی یافت نشد."
-                keyboard = KeyboardBuilder.back_to_main()
-                await query.edit_message_text(message, reply_markup=keyboard, parse_mode='Markdown')
-                return ConversationHandler.END
-            
-            # Convert stats to list format
-            session_list = []
-            for session_name, session_data in stats.items():
-                # Extract phone number from session name
-                phone = session_name.replace('sessions/', '').replace('.session', '')
-                
-                # Get daily stats
-                daily_stats = session_data.get('daily_stats', {})
-                
-                # Get monitoring info
-                monitoring_channels = []
-                if session_data.get('monitoring'):
-                    monitoring_channels = session_data.get('monitoring_channels', [])
-                
-                session_info = {
-                    'session_name': session_name,
-                    'phone': phone,
-                    'connected': session_data.get('connected', False),
-                    'monitoring': session_data.get('monitoring', False),
-                    'monitoring_channels': monitoring_channels,
-                    'queue_depth': session_data.get('queue_depth', 0),
-                    'daily_stats': {
-                        'messages_read': daily_stats.get('messages_read', 0),
-                        'groups_scraped': daily_stats.get('groups_scraped_today', 0),
-                    }
-                }
-                session_list.append(session_info)
-            
-            # Paginate sessions
-            total_sessions = len(session_list)
-            total_pages = (total_sessions + self.sessions_per_page - 1) // self.sessions_per_page
-            start_idx = page * self.sessions_per_page
-            end_idx = min(start_idx + self.sessions_per_page, total_sessions)
-            page_sessions = session_list[start_idx:end_idx]
-            
-            # Format session list
-            message = MessageFormatter.format_session_list(page_sessions, page + 1, total_pages)
-            
-            # Build keyboard with session buttons and pagination
-            keyboard = KeyboardBuilder.session_list(
-                sessions=page_sessions,
-                page=page,
-                total_pages=total_pages
-            )
-            
-            await query.edit_message_text(
-                message,
-                reply_markup=keyboard,
-                parse_mode='Markdown'
-            )
-            
-            return SELECT_SESSION
-            
-        except Exception as e:
-            error_msg = MessageFormatter.format_error(
-                error_type="دریافت لیست سشن‌ها",
-                description=str(e),
-                show_retry=True
-            )
-            keyboard = KeyboardBuilder.back_to_main()
-            await query.edit_message_text(error_msg, reply_markup=keyboard, parse_mode='Markdown')
-            return ConversationHandler.END
-    
-    async def show_session_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """
-        Show detailed information for a specific session
-        
-        Requirements: AC-4.2, AC-4.3, AC-4.4, AC-4.5
+        Requirements: AC-4.4
         """
         query = update.callback_query
         await query.answer()
         
-        user_id = query.from_user.id
+        # Get health status
+        health_status = await self._get_health_status()
         
-        # Extract session name from callback data
-        # Format: session:details:session_name
-        try:
-            session_name = query.data.split('session:details:')[1]
-        except IndexError:
-            await query.edit_message_text("❌ خطا در شناسایی سشن")
-            return ConversationHandler.END
+        # Format health status message
+        message_text = self._format_health_status(health_status)
         
-        # Update user session
-        if user_id not in self.user_sessions:
-            self.user_sessions[user_id] = SessionUserSession(
-                user_id=user_id,
-                action='details'
-            )
-        self.user_sessions[user_id].action = 'details'
-        self.user_sessions[user_id].selected_session = session_name
+        # Build keyboard
+        keyboard = KeyboardBuilder.back_to_session_menu()
         
-        # Show loading message
-        await query.edit_message_text(PLEASE_WAIT, parse_mode='Markdown')
+        await query.edit_message_text(
+            text=message_text,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
         
-        try:
-            # Get session statistics
-            stats = await self.session_manager.get_session_stats()
-            
-            if session_name not in stats:
-                message = f"❌ سشن `{session_name}` یافت نشد."
-                keyboard = KeyboardBuilder.back_to_session_list()
-                await query.edit_message_text(message, reply_markup=keyboard, parse_mode='Markdown')
-                return SELECT_SESSION
-            
-            session_data = stats[session_name]
-            
-            # Extract phone number
-            phone = session_name.replace('sessions/', '').replace('.session', '')
-            
-            # Get monitoring channels
-            monitoring_channels = []
-            if session_data.get('monitoring'):
-                # Get monitoring targets from session manager
-                try:
-                    # Access the session directly to get monitoring targets
-                    session = self.session_manager.manager.sessions.get(session_name)
-                    if session and hasattr(session, 'monitoring_targets'):
-                        monitoring_channels = list(session.monitoring_targets.keys())
-                except Exception:
-                    pass
-            
-            # Get active operations
-            active_operations = []
-            current_op = session_data.get('current_operation')
-            if current_op:
-                op_start = session_data.get('operation_start_time')
-                if op_start:
-                    duration = time.time() - op_start
-                    active_operations.append({
-                        'type': current_op,
-                        'progress': f'در حال اجرا ({int(duration)}s)'
-                    })
-            
-            # Get daily stats
-            daily_stats = session_data.get('daily_stats', {})
-            
-            # Get health status (placeholder - will be enhanced later)
-            health = {
-                'healthy': session_data.get('connected', False),
-                'last_check': time.time()
-            }
-            
-            # Format session details
-            session_info = {
-                'phone': phone,
-                'connected': session_data.get('connected', False),
-                'monitoring': session_data.get('monitoring', False),
-                'monitoring_channels': monitoring_channels,
-                'active_operations': active_operations,
-                'daily_stats': {
-                    'messages_read': daily_stats.get('messages_read', 0),
-                    'daily_limit': 500,
-                    'groups_scraped': daily_stats.get('groups_scraped_today', 0),
-                    'scrape_limit': 10,
-                    'messages_sent': 0  # Placeholder
-                },
-                'health': health,
-                'queue_depth': session_data.get('queue_depth', 0)
-            }
-            
-            message = MessageFormatter.format_session_stats(session_info)
-            
-            # Build keyboard
-            keyboard = KeyboardBuilder.session_details(session_name)
-            
-            await query.edit_message_text(
-                message,
-                reply_markup=keyboard,
-                parse_mode='Markdown'
-            )
-            
-            return VIEW_SESSION_DETAILS
-            
-        except Exception as e:
-            error_msg = MessageFormatter.format_error(
-                error_type="دریافت جزئیات سشن",
-                description=str(e),
-                show_retry=True
-            )
-            keyboard = KeyboardBuilder.back_to_session_list()
-            await query.edit_message_text(error_msg, reply_markup=keyboard, parse_mode='Markdown')
-            return SELECT_SESSION
-    
-    async def refresh_session_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """
-        Refresh session details view
-        
-        Requirements: AC-5.6
-        """
-        # Simply call show_session_details again
-        return await self.show_session_details(update, context)
+        return SELECT_SESSION_ACTION
     
     async def show_load_distribution(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """
-        Show load distribution across sessions with text-based visualization
+        Display load distribution across sessions
         
-        Requirements: AC-4.6
+        Requirements: AC-4.5, AC-4.6
         """
         query = update.callback_query
         await query.answer()
         
-        user_id = query.from_user.id
+        # Get load distribution
+        load_distribution = await self._get_load_distribution()
         
-        # Update user session
-        if user_id not in self.user_sessions:
-            self.user_sessions[user_id] = SessionUserSession(
-                user_id=user_id,
-                action='load_distribution'
-            )
-        self.user_sessions[user_id].action = 'load_distribution'
+        # Format load distribution message
+        message_text = MessageFormatter.format_load_distribution(load_distribution)
         
-        # Show loading message
-        await query.edit_message_text(PLEASE_WAIT, parse_mode='Markdown')
+        # Build keyboard
+        keyboard = KeyboardBuilder.load_distribution_menu()
         
-        try:
-            # Get session statistics
-            stats = await self.session_manager.get_session_stats()
-            
-            if not stats:
-                message = "⚖️ **توزیع بار**\n\nهیچ سشنی یافت نشد."
-                keyboard = KeyboardBuilder.back_to_session_menu()
-                await query.edit_message_text(message, reply_markup=keyboard, parse_mode='Markdown')
-                return SELECT_SESSION_ACTION
-            
-            # Prepare session load data
-            session_load_data = []
-            for session_name, session_data in stats.items():
-                phone = session_name.replace('sessions/', '').replace('.session', '')
-                
-                # Calculate current load
-                # Load = active tasks + queue depth
-                current_load = session_data.get('active_tasks', 0)
-                queue_depth = session_data.get('queue_depth', 0)
-                
-                session_load_data.append({
-                    'phone': phone,
-                    'current_load': current_load,
-                    'queue_depth': queue_depth,
-                    'connected': session_data.get('connected', False)
-                })
-            
-            # Sort by load (highest first)
-            session_load_data.sort(key=lambda x: x['current_load'], reverse=True)
-            
-            # Format load distribution
-            message = MessageFormatter.format_load_distribution(session_load_data)
-            
-            # Build keyboard
-            keyboard = KeyboardBuilder.load_distribution_menu()
-            
-            await query.edit_message_text(
-                message,
-                reply_markup=keyboard,
-                parse_mode='Markdown'
-            )
-            
-            return SELECT_SESSION_ACTION
-            
-        except Exception as e:
-            error_msg = MessageFormatter.format_error(
-                error_type="دریافت توزیع بار",
-                description=str(e),
-                show_retry=True
-            )
-            keyboard = KeyboardBuilder.back_to_session_menu()
-            await query.edit_message_text(error_msg, reply_markup=keyboard, parse_mode='Markdown')
-            return SELECT_SESSION_ACTION
+        await query.edit_message_text(
+            text=message_text,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        
+        return SELECT_SESSION_ACTION
     
     async def cancel_operation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """
-        Cancel current operation
-        """
-        query = update.callback_query if update.callback_query else None
+        """Cancel current operation"""
+        query = update.callback_query
+        await query.answer()
         
-        if query:
-            await query.answer()
-            user_id = query.from_user.id
-        else:
-            user_id = update.effective_user.id
+        user_id = update.effective_user.id
+        self.state_manager.delete_user_session(user_id)
         
-        # Clean up user session
-        if user_id in self.user_sessions:
-            del self.user_sessions[user_id]
-        
-        message = OPERATION_CANCELLED
-        keyboard = KeyboardBuilder.back_to_main()
-        
-        if query:
-            await query.edit_message_text(message, reply_markup=keyboard, parse_mode='Markdown')
-        else:
-            await update.message.reply_text(message, reply_markup=keyboard, parse_mode='Markdown')
+        await query.edit_message_text(
+            text="❌ عملیات لغو شد.",
+            parse_mode='Markdown'
+        )
         
         return ConversationHandler.END
+    
+    # Helper methods
+    
+    async def _get_all_sessions(self) -> List[Dict[str, Any]]:
+        """
+        Get list of all sessions with basic info
+        
+        Returns:
+            List of session dicts with basic information
+        """
+        sessions_list = []
+        
+        for session_name, session in self.session_manager.sessions.items():
+            try:
+                # Get basic session info
+                is_connected = session.is_connected()
+                
+                # Get phone number
+                phone = "نامشخص"
+                if is_connected and hasattr(session, 'client') and session.client:
+                    try:
+                        me = await session.client.get_me()
+                        if me and me.phone:
+                            phone = f"+{me.phone}"
+                    except Exception as e:
+                        self.logger.debug(f"Could not get phone for {session_name}: {e}")
+                
+                # Check if monitoring
+                monitoring = False
+                monitoring_channels = []
+                # TODO: Get actual monitoring status from session
+                
+                # Get queue depth
+                queue_depth = 0
+                if hasattr(session, 'operation_queue'):
+                    queue_depth = len(session.operation_queue)
+                
+                # Get daily stats
+                daily_stats = {
+                    'messages_read': 0,
+                    'groups_scraped': 0,
+                    'messages_sent': 0
+                }
+                # TODO: Get actual daily stats from session
+                
+                sessions_list.append({
+                    'session_name': session_name,
+                    'phone': phone,
+                    'connected': is_connected,
+                    'monitoring': monitoring,
+                    'monitoring_channels': monitoring_channels,
+                    'queue_depth': queue_depth,
+                    'daily_stats': daily_stats
+                })
+            
+            except Exception as e:
+                self.logger.error(f"Error getting info for session {session_name}: {e}")
+                # Add session with minimal info
+                sessions_list.append({
+                    'session_name': session_name,
+                    'phone': 'خطا',
+                    'connected': False,
+                    'monitoring': False,
+                    'monitoring_channels': [],
+                    'queue_depth': 0,
+                    'daily_stats': {}
+                })
+        
+        return sessions_list
+    
+    async def _get_session_details(self, session_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get detailed information for a specific session
+        
+        Args:
+            session_name: Name of the session
+            
+        Returns:
+            Dict with detailed session information or None if not found
+        """
+        session = self.session_manager.sessions.get(session_name)
+        if not session:
+            return None
+        
+        try:
+            # Get connection status
+            is_connected = session.is_connected()
+            
+            # Get phone number
+            phone = "نامشخص"
+            if is_connected and hasattr(session, 'client') and session.client:
+                try:
+                    me = await session.client.get_me()
+                    if me and me.phone:
+                        phone = f"+{me.phone}"
+                except Exception as e:
+                    self.logger.debug(f"Could not get phone for {session_name}: {e}")
+            
+            # Get monitoring status
+            monitoring = False
+            monitoring_channels = []
+            # TODO: Get actual monitoring status from session
+            
+            # Get active operations
+            active_operations = []
+            # TODO: Get actual active operations from session
+            
+            # Get queue depth
+            queue_depth = 0
+            if hasattr(session, 'operation_queue'):
+                queue_depth = len(session.operation_queue)
+            
+            # Get daily stats
+            daily_stats = {
+                'messages_read': 0,
+                'daily_limit': 500,
+                'groups_scraped': 0,
+                'scrape_limit': 10,
+                'messages_sent': 0
+            }
+            # TODO: Get actual daily stats from session
+            
+            # Get health status
+            health = {
+                'healthy': is_connected,
+                'last_check': datetime.now().timestamp()
+            }
+            # TODO: Get actual health status from health monitor
+            
+            return {
+                'session_name': session_name,
+                'phone': phone,
+                'connected': is_connected,
+                'monitoring': monitoring,
+                'monitoring_channels': monitoring_channels,
+                'active_operations': active_operations,
+                'queue_depth': queue_depth,
+                'daily_stats': daily_stats,
+                'health': health
+            }
+        
+        except Exception as e:
+            self.logger.error(f"Error getting details for session {session_name}: {e}")
+            return None
+    
+    async def _get_daily_statistics(self) -> Dict[str, Any]:
+        """
+        Get daily statistics for all sessions
+        
+        Returns:
+            Dict with daily statistics
+        """
+        total_messages_read = 0
+        total_groups_scraped = 0
+        total_messages_sent = 0
+        
+        session_stats = []
+        
+        for session_name, session in self.session_manager.sessions.items():
+            try:
+                # Get phone number
+                phone = "نامشخص"
+                if session.is_connected() and hasattr(session, 'client') and session.client:
+                    try:
+                        me = await session.client.get_me()
+                        if me and me.phone:
+                            phone = f"+{me.phone}"
+                    except:
+                        pass
+                
+                # TODO: Get actual daily stats from session
+                messages_read = 0
+                groups_scraped = 0
+                messages_sent = 0
+                
+                total_messages_read += messages_read
+                total_groups_scraped += groups_scraped
+                total_messages_sent += messages_sent
+                
+                session_stats.append({
+                    'phone': phone,
+                    'messages_read': messages_read,
+                    'groups_scraped': groups_scraped,
+                    'messages_sent': messages_sent
+                })
+            
+            except Exception as e:
+                self.logger.error(f"Error getting daily stats for {session_name}: {e}")
+        
+        return {
+            'total_messages_read': total_messages_read,
+            'total_groups_scraped': total_groups_scraped,
+            'total_messages_sent': total_messages_sent,
+            'session_stats': session_stats
+        }
+    
+    async def _get_health_status(self) -> List[Dict[str, Any]]:
+        """
+        Get health status for all sessions
+        
+        Returns:
+            List of session health status dicts
+        """
+        health_status = []
+        
+        for session_name, session in self.session_manager.sessions.items():
+            try:
+                # Get phone number
+                phone = "نامشخص"
+                if session.is_connected() and hasattr(session, 'client') and session.client:
+                    try:
+                        me = await session.client.get_me()
+                        if me and me.phone:
+                            phone = f"+{me.phone}"
+                    except:
+                        pass
+                
+                # Get connection status
+                is_connected = session.is_connected()
+                
+                # TODO: Get actual health metrics from health monitor
+                health_indicators = {
+                    'connection': is_connected,
+                    'response_time': 'نامشخص',
+                    'error_rate': 0
+                }
+                
+                last_check = datetime.now().timestamp()
+                
+                health_status.append({
+                    'phone': phone,
+                    'session_name': session_name,
+                    'healthy': is_connected,
+                    'indicators': health_indicators,
+                    'last_check': last_check
+                })
+            
+            except Exception as e:
+                self.logger.error(f"Error getting health status for {session_name}: {e}")
+        
+        return health_status
+    
+    async def _get_load_distribution(self) -> List[Dict[str, Any]]:
+        """
+        Get load distribution across sessions
+        
+        Returns:
+            List of session load dicts
+        """
+        load_distribution = []
+        
+        for session_name, session in self.session_manager.sessions.items():
+            try:
+                # Get phone number
+                phone = "نامشخص"
+                if session.is_connected() and hasattr(session, 'client') and session.client:
+                    try:
+                        me = await session.client.get_me()
+                        if me and me.phone:
+                            phone = f"+{me.phone}"
+                    except:
+                        pass
+                
+                # Get current load
+                current_load = self.session_manager.session_load.get(session_name, 0)
+                
+                # Get queue depth
+                queue_depth = 0
+                if hasattr(session, 'operation_queue'):
+                    queue_depth = len(session.operation_queue)
+                
+                load_distribution.append({
+                    'phone': phone,
+                    'session_name': session_name,
+                    'current_load': current_load,
+                    'queue_depth': queue_depth
+                })
+            
+            except Exception as e:
+                self.logger.error(f"Error getting load for {session_name}: {e}")
+        
+        return load_distribution
+    
+    def _format_daily_statistics(self, stats: Dict[str, Any]) -> str:
+        """
+        Format daily statistics message
+        
+        Args:
+            stats: Daily statistics dict
+            
+        Returns:
+            Formatted message string
+        """
+        result = "📊 **آمار روزانه**\n\n"
+        result += f"**کل عملیات امروز:**\n"
+        result += f"• پیام‌های خوانده شده: {stats['total_messages_read']}\n"
+        result += f"• گروه‌های اسکرپ شده: {stats['total_groups_scraped']}\n"
+        result += f"• پیام‌های ارسال شده: {stats['total_messages_sent']}\n\n"
+        
+        if stats['session_stats']:
+            result += "**آمار به تفکیک سشن:**\n\n"
+            for session_stat in stats['session_stats']:
+                result += f"📱 {session_stat['phone']}\n"
+                result += f"   • پیام‌ها: {session_stat['messages_read']}\n"
+                result += f"   • گروه‌ها: {session_stat['groups_scraped']}\n"
+                result += f"   • ارسال: {session_stat['messages_sent']}\n\n"
+        
+        # Add timestamp
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result += f"\n⏰ آخرین بروزرسانی: {now}"
+        
+        return result
+    
+    def _format_health_status(self, health_status: List[Dict[str, Any]]) -> str:
+        """
+        Format health status message
+        
+        Args:
+            health_status: List of health status dicts
+            
+        Returns:
+            Formatted message string
+        """
+        result = "💚 **وضعیت سلامت سشن‌ها**\n\n"
+        
+        if not health_status:
+            result += "هیچ سشنی یافت نشد."
+            return result
+        
+        healthy_count = sum(1 for s in health_status if s['healthy'])
+        total_count = len(health_status)
+        
+        result += f"**خلاصه:** {healthy_count}/{total_count} سشن سالم\n\n"
+        
+        for session in health_status:
+            status_icon = "✅" if session['healthy'] else "❌"
+            status_text = "سالم" if session['healthy'] else "مشکل دارد"
+            
+            result += f"{status_icon} **{session['phone']}**\n"
+            result += f"   وضعیت: {status_text}\n"
+            
+            # Format last check time
+            last_check = session.get('last_check')
+            if last_check:
+                time_ago = MessageFormatter._format_time_ago(last_check)
+                result += f"   آخرین بررسی: {time_ago}\n"
+            
+            result += "\n"
+        
+        # Add timestamp
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result += f"\n⏰ آخرین بروزرسانی: {now}"
+        
+        return result

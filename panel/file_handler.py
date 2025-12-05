@@ -2,17 +2,30 @@
 File Handler - Centralized file operations for CSV and media files
 
 Handles:
-- CSV file upload and validation (AC-7.1, AC-7.2)
-- Media file upload and validation (AC-7.4, AC-7.5)
-- CSV file download/send (AC-7.3)
+- CSV file upload and validation (Requirements: 7.1, 7.2, 7.3, 13.2)
+- Media file upload and validation (Requirements: 7.4, 7.5, 7.6, 7.7)
+- CSV generation from scraping results (Requirements: 7.3)
+- File cleanup utilities (Requirements: 7.1-7.7)
+
+This module provides comprehensive file handling for the Telegram Bot Control Panel,
+including validation, processing, and cleanup of CSV and media files.
 """
 
 import os
 import csv
 import logging
-from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass
+import mimetypes
+import time
+from typing import Dict, List, Optional, Any, Tuple, Union
+from dataclasses import dataclass, field
 from pathlib import Path
+
+# Import validators for additional validation
+try:
+    from .validators import InputValidator
+except ImportError:
+    # Fallback if validators not available
+    InputValidator = None
 
 
 @dataclass
@@ -55,18 +68,21 @@ class FileHandler:
     Provides validation and processing for:
     - CSV files (recipient lists)
     - Media files (images, videos, documents)
+    - File cleanup and temporary file management
+    
+    Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7
     """
     
-    # File size limits (in bytes)
-    MAX_CSV_SIZE = 10 * 1024 * 1024  # 10 MB
-    MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
-    MAX_VIDEO_SIZE = 50 * 1024 * 1024  # 50 MB
-    MAX_DOCUMENT_SIZE = 50 * 1024 * 1024  # 50 MB
+    # File size limits (in bytes) - Requirements: 7.1, 7.4, 7.5, 7.6
+    MAX_CSV_SIZE = 20 * 1024 * 1024  # 20 MB (Requirement 7.1)
+    MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB (Requirement 7.4)
+    MAX_VIDEO_SIZE = 50 * 1024 * 1024  # 50 MB (Requirement 7.5)
+    MAX_DOCUMENT_SIZE = 20 * 1024 * 1024  # 20 MB (Requirement 7.6)
     
-    # Allowed file extensions
-    ALLOWED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
-    ALLOWED_VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
-    ALLOWED_DOCUMENT_EXTENSIONS = {'.pdf', '.doc', '.docx', '.txt', '.zip', '.rar'}
+    # Allowed file extensions - Requirements: 7.4, 7.5, 7.6
+    ALLOWED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}  # Requirement 7.4
+    ALLOWED_VIDEO_EXTENSIONS = {'.mp4', '.mov'}  # Requirement 7.5
+    ALLOWED_DOCUMENT_EXTENSIONS = {'.pdf', '.doc', '.docx', '.txt'}  # Requirement 7.6
     
     def __init__(self, temp_dir: str = "./temp"):
         """
@@ -78,8 +94,13 @@ class FileHandler:
         self.temp_dir = temp_dir
         self.logger = logging.getLogger("FileHandler")
         
+        # Track temporary files for cleanup
+        self._temp_files: List[str] = []
+        
         # Create temp directory if it doesn't exist
         os.makedirs(self.temp_dir, exist_ok=True)
+        
+        self.logger.info(f"FileHandler initialized with temp_dir: {self.temp_dir}")
     
     def validate_csv(self, file_path: str) -> CSVValidationResult:
         """
@@ -189,12 +210,24 @@ class FileHandler:
         except UnicodeDecodeError:
             return CSVValidationResult(
                 valid=False,
-                error="فایل دارای کاراکترهای نامعتبر است. لطفاً از UTF-8 استفاده کنید"
+                error=(
+                    "❌ فایل دارای کاراکترهای نامعتبر است\n\n"
+                    "لطفاً از کدگذاری UTF-8 استفاده کنید.\n"
+                    "در Excel: ذخیره به عنوان → CSV UTF-8"
+                )
             )
         except csv.Error as e:
             return CSVValidationResult(
                 valid=False,
-                error=f"فرمت CSV نامعتبر است: {str(e)}"
+                error=(
+                    f"❌ فرمت CSV نامعتبر است\n\n"
+                    f"خطا: {str(e)}\n\n"
+                    "فایل باید فرمت CSV استاندارد داشته باشد.\n"
+                    "مثال:\n"
+                    "@username1\n"
+                    "@username2\n"
+                    "123456789"
+                )
             )
         except Exception as e:
             self.logger.error(f"Error validating CSV: {e}")
@@ -253,7 +286,13 @@ class FileHandler:
             else:
                 return FileValidationResult(
                     valid=False,
-                    error=f"نوع رسانه نامعتبر: {media_type}"
+                    error=(
+                        f"❌ نوع رسانه نامعتبر: {media_type}\n\n"
+                        "انواع معتبر:\n"
+                        "• image: JPEG, PNG, WebP\n"
+                        "• video: MP4, MOV\n"
+                        "• document: PDF, DOC, DOCX, TXT"
+                    )
                 )
             
             if file_size > max_size:
@@ -384,6 +423,8 @@ class FileHandler:
         
         Returns:
             True if file was created successfully
+            
+        Requirements: 7.3
         """
         try:
             with open(output_path, 'w', encoding='utf-8', newline='') as f:
@@ -396,9 +437,443 @@ class FileHandler:
                 # Write data rows
                 writer.writerows(data)
             
-            self.logger.info(f"Created CSV file: {output_path}")
+            self.logger.info(f"Created CSV file: {output_path} with {len(data)} rows")
             return True
         
         except Exception as e:
             self.logger.error(f"Error creating CSV file: {e}")
+            return False
+    
+    async def process_csv_upload(
+        self,
+        file_path: str,
+        user_id: int
+    ) -> Tuple[bool, Union[List[str], str]]:
+        """
+        Process uploaded CSV file
+        
+        Validates the CSV file and extracts recipient list.
+        
+        Args:
+            file_path: Path to uploaded CSV file
+            user_id: User ID for tracking
+        
+        Returns:
+            Tuple of (success, recipients_or_error)
+            - If success: (True, List[str] of recipients)
+            - If failure: (False, error_message)
+            
+        Requirements: 7.1, 7.2, 13.2, 13.5
+        """
+        self.logger.info(f"Processing CSV upload for user {user_id}: {file_path}")
+        
+        # Validate CSV format and structure
+        validation_result = self.validate_csv(file_path)
+        
+        if not validation_result.valid:
+            self.logger.warning(f"CSV validation failed: {validation_result.error}")
+            return False, validation_result.error
+        
+        # Additional validation using InputValidator if available
+        if InputValidator:
+            recipient_validation = InputValidator.validate_csv_recipients(
+                validation_result.recipients
+            )
+            if not recipient_validation.valid:
+                self.logger.warning(
+                    f"CSV recipient validation failed: {recipient_validation.error_message}"
+                )
+                return False, recipient_validation.error_message
+        
+        # Track temp file for cleanup
+        self._temp_files.append(file_path)
+        
+        self.logger.info(
+            f"CSV validated successfully: {len(validation_result.recipients)} recipients"
+        )
+        
+        return True, validation_result.recipients
+    
+    async def process_media_upload(
+        self,
+        file_path: str,
+        media_type: str,
+        user_id: int
+    ) -> Tuple[bool, Union[str, str]]:
+        """
+        Process uploaded media file
+        
+        Validates the media file and performs integrity checks.
+        
+        Args:
+            file_path: Path to uploaded media file
+            media_type: Type of media ('image', 'video', 'document')
+            user_id: User ID for tracking
+        
+        Returns:
+            Tuple of (success, file_path_or_error)
+            - If success: (True, file_path)
+            - If failure: (False, error_message)
+            
+        Requirements: 7.4, 7.5, 7.6, 7.7
+        """
+        self.logger.info(
+            f"Processing {media_type} upload for user {user_id}: {file_path}"
+        )
+        
+        # Validate media file
+        validation_result = self.validate_media(file_path, media_type)
+        
+        if not validation_result.valid:
+            self.logger.warning(f"Media validation failed: {validation_result.error}")
+            return False, validation_result.error
+        
+        # Perform integrity check
+        integrity_result = self._check_media_integrity(file_path, media_type)
+        
+        if not integrity_result.valid:
+            self.logger.warning(f"Media integrity check failed: {integrity_result.error}")
+            return False, integrity_result.error
+        
+        # Track temp file for cleanup
+        self._temp_files.append(file_path)
+        
+        self.logger.info(
+            f"Media validated successfully: {media_type} "
+            f"({validation_result.metadata.get('size_mb', 0)} MB)"
+        )
+        
+        return True, file_path
+    
+    def _check_media_integrity(
+        self,
+        file_path: str,
+        media_type: str
+    ) -> FileValidationResult:
+        """
+        Check media file integrity
+        
+        Performs basic integrity checks:
+        - File can be opened
+        - File has valid header/magic bytes
+        - File is not corrupted
+        
+        Args:
+            file_path: Path to media file
+            media_type: Type of media ('image', 'video', 'document')
+        
+        Returns:
+            FileValidationResult with integrity check status
+            
+        Requirements: 7.7
+        """
+        try:
+            # Check if file can be opened and read
+            with open(file_path, 'rb') as f:
+                # Read first few bytes to check magic numbers
+                header = f.read(16)
+                
+                if not header:
+                    return FileValidationResult(
+                        valid=False,
+                        error="فایل خراب است (هدر خالی)"
+                    )
+                
+                # Basic magic number checks
+                if media_type == 'image':
+                    # Check for common image formats
+                    if header[:2] == b'\xff\xd8':  # JPEG
+                        pass
+                    elif header[:8] == b'\x89PNG\r\n\x1a\n':  # PNG
+                        pass
+                    elif header[:6] in (b'GIF87a', b'GIF89a'):  # GIF
+                        pass
+                    elif header[:4] == b'RIFF' and header[8:12] == b'WEBP':  # WebP
+                        pass
+                    else:
+                        return FileValidationResult(
+                            valid=False,
+                            error=(
+                                "❌ فرمت تصویر نامعتبر یا فایل خراب است\n\n"
+                                "فرمت‌های پشتیبانی شده:\n"
+                                "• JPEG (.jpg, .jpeg)\n"
+                                "• PNG (.png)\n"
+                                "• WebP (.webp)\n\n"
+                                "لطفاً فایل را بررسی کنید و دوباره آپلود کنید."
+                            )
+                        )
+                
+                elif media_type == 'video':
+                    # Check for common video formats
+                    # MP4/MOV typically start with ftyp
+                    if b'ftyp' not in header[:16]:
+                        # Some videos might have different headers, be lenient
+                        self.logger.warning(
+                            f"Video file may have non-standard header: {file_path}"
+                        )
+                
+                elif media_type == 'document':
+                    # Check for common document formats
+                    if header[:4] == b'%PDF':  # PDF
+                        pass
+                    elif header[:2] == b'PK':  # ZIP-based (DOCX)
+                        pass
+                    # For other document types, just check it's not empty
+                
+                # Try to seek to end to ensure file is complete
+                f.seek(0, 2)  # Seek to end
+                file_size = f.tell()
+                
+                if file_size == 0:
+                    return FileValidationResult(
+                        valid=False,
+                        error="فایل خالی است"
+                    )
+            
+            return FileValidationResult(
+                valid=True,
+                error=None,
+                metadata={'integrity_checked': True}
+            )
+        
+        except IOError as e:
+            return FileValidationResult(
+                valid=False,
+                error=f"خطا در خواندن فایل: {str(e)}"
+            )
+        except Exception as e:
+            self.logger.error(f"Error checking media integrity: {e}")
+            return FileValidationResult(
+                valid=False,
+                error=f"خطا در بررسی یکپارچگی فایل: {str(e)}"
+            )
+    
+    def generate_csv_from_scraping_results(
+        self,
+        results: List[Dict[str, Any]],
+        output_path: str
+    ) -> bool:
+        """
+        Generate CSV file from scraping results
+        
+        Creates a CSV file with member data from scraping operations.
+        
+        Args:
+            results: List of member dictionaries with keys like:
+                     'user_id', 'username', 'first_name', 'last_name', 'phone'
+            output_path: Path where CSV should be saved
+        
+        Returns:
+            True if file was created successfully
+            
+        Requirements: 7.3
+        """
+        try:
+            if not results:
+                self.logger.warning("No results to generate CSV from")
+                return False
+            
+            # Define headers based on available fields
+            headers = ['user_id', 'username', 'first_name', 'last_name', 'phone']
+            
+            # Convert results to rows
+            rows = []
+            for member in results:
+                row = [
+                    str(member.get('user_id', '')),
+                    member.get('username', ''),
+                    member.get('first_name', ''),
+                    member.get('last_name', ''),
+                    member.get('phone', '')
+                ]
+                rows.append(row)
+            
+            # Create CSV file
+            success = self.create_csv_from_data(rows, output_path, headers)
+            
+            if success:
+                self.logger.info(
+                    f"Generated CSV from scraping results: {len(rows)} members"
+                )
+            
+            return success
+        
+        except Exception as e:
+            self.logger.error(f"Error generating CSV from scraping results: {e}")
+            return False
+    
+    def cleanup_temp_files(self, file_paths: Optional[List[str]] = None) -> int:
+        """
+        Clean up temporary files
+        
+        Deletes specified files or all tracked temporary files.
+        
+        Args:
+            file_paths: Optional list of specific files to delete.
+                       If None, deletes all tracked temp files.
+        
+        Returns:
+            Number of files successfully deleted
+            
+        Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6
+        """
+        files_to_delete = file_paths if file_paths is not None else self._temp_files
+        deleted_count = 0
+        
+        for file_path in files_to_delete:
+            if self.cleanup_file(file_path):
+                deleted_count += 1
+                # Remove from tracked files
+                if file_path in self._temp_files:
+                    self._temp_files.remove(file_path)
+        
+        if deleted_count > 0:
+            self.logger.info(f"Cleaned up {deleted_count} temporary files")
+        
+        return deleted_count
+    
+    def cleanup_on_error(self, user_id: int) -> int:
+        """
+        Clean up all temporary files for a specific user on error
+        
+        Args:
+            user_id: User ID whose files should be cleaned up
+        
+        Returns:
+            Number of files successfully deleted
+            
+        Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6
+        """
+        user_files = [
+            f for f in self._temp_files
+            if f"_{user_id}_" in f
+        ]
+        
+        deleted_count = self.cleanup_temp_files(user_files)
+        
+        if deleted_count > 0:
+            self.logger.info(
+                f"Cleaned up {deleted_count} files for user {user_id} on error"
+            )
+        
+        return deleted_count
+    
+    def get_tracked_files(self) -> List[str]:
+        """
+        Get list of currently tracked temporary files
+        
+        Returns:
+            List of file paths being tracked
+        """
+        return self._temp_files.copy()
+    
+    def cleanup_old_files(self, max_age_hours: int = 24) -> int:
+        """
+        Clean up old temporary files based on age
+        
+        Args:
+            max_age_hours: Maximum age in hours before file is deleted
+        
+        Returns:
+            Number of files successfully deleted
+        """
+        deleted_count = 0
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
+        
+        try:
+            # Check all files in temp directory
+            for filename in os.listdir(self.temp_dir):
+                file_path = os.path.join(self.temp_dir, filename)
+                
+                # Skip if not a file
+                if not os.path.isfile(file_path):
+                    continue
+                
+                # Check file age
+                file_age = current_time - os.path.getmtime(file_path)
+                
+                if file_age > max_age_seconds:
+                    if self.cleanup_file(file_path):
+                        deleted_count += 1
+            
+            if deleted_count > 0:
+                self.logger.info(
+                    f"Cleaned up {deleted_count} old files (>{max_age_hours}h)"
+                )
+        
+        except Exception as e:
+            self.logger.error(f"Error cleaning up old files: {e}")
+        
+        return deleted_count
+    
+    async def send_file_to_user(
+        self,
+        bot,
+        chat_id: int,
+        file_path: str,
+        caption: str = ""
+    ) -> bool:
+        """
+        Send a file to a user via Telegram
+        
+        This is a helper method for sending CSV files or other documents
+        to users through the bot.
+        
+        Args:
+            bot: Telegram Bot instance
+            chat_id: Chat ID to send file to
+            file_path: Path to file to send
+            caption: Optional caption for the file
+        
+        Returns:
+            True if file was sent successfully
+            
+        Requirements: 7.3
+        """
+        try:
+            if not os.path.exists(file_path):
+                self.logger.error(f"File not found: {file_path}")
+                return False
+            
+            # Determine file type based on extension
+            file_ext = Path(file_path).suffix.lower()
+            
+            with open(file_path, 'rb') as f:
+                if file_ext == '.csv':
+                    # Send as document
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        caption=caption,
+                        filename=os.path.basename(file_path)
+                    )
+                elif file_ext in self.ALLOWED_IMAGE_EXTENSIONS:
+                    # Send as photo
+                    await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=f,
+                        caption=caption
+                    )
+                elif file_ext in self.ALLOWED_VIDEO_EXTENSIONS:
+                    # Send as video
+                    await bot.send_video(
+                        chat_id=chat_id,
+                        video=f,
+                        caption=caption
+                    )
+                else:
+                    # Send as document
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        caption=caption,
+                        filename=os.path.basename(file_path)
+                    )
+            
+            self.logger.info(f"Sent file to user {chat_id}: {file_path}")
+            return True
+        
+        except Exception as e:
+            self.logger.error(f"Error sending file to user: {e}")
             return False

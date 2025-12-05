@@ -14,6 +14,9 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 import logging
 
+# Import cache manager
+from .cache_manager import CacheManager
+
 
 @dataclass
 class UserSession:
@@ -164,7 +167,7 @@ class MonitoringConfig:
     """
     chat_id: str
     reactions: List[Dict[str, Any]] = field(default_factory=list)
-    cooldown: float = 1.0
+    cooldown: float = 2.0
     enabled: bool = True
     added_at: float = field(default_factory=time.time)
     stats: Dict[str, int] = field(default_factory=lambda: {
@@ -248,6 +251,13 @@ class StateManager:
         # Configuration
         self.session_timeout = session_timeout
         self.cleanup_interval = cleanup_interval
+        
+        # Cache manager for performance optimization
+        self.cache_manager = CacheManager(
+            max_size=1000,
+            default_ttl=300,  # 5 minutes default TTL
+            cleanup_interval=60
+        )
         
         # Cleanup task
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -475,7 +485,7 @@ class StateManager:
         self,
         chat_id: str,
         reactions: Optional[List[Dict[str, Any]]] = None,
-        cooldown: float = 1.0,
+        cooldown: float = 2.0,
         enabled: bool = True
     ) -> MonitoringConfig:
         """
@@ -497,6 +507,10 @@ class StateManager:
             enabled=enabled
         )
         self.monitoring_configs[chat_id] = config
+        
+        # Invalidate cache
+        asyncio.create_task(self.invalidate_monitoring_cache())
+        
         self.logger.debug(f"Created monitoring config for {chat_id}")
         return config
     
@@ -536,6 +550,9 @@ class StateManager:
         if enabled is not None:
             config.enabled = enabled
         
+        # Invalidate cache
+        asyncio.create_task(self.invalidate_monitoring_cache())
+        
         return config
     
     def delete_monitoring_config(self, chat_id: str) -> bool:
@@ -550,6 +567,10 @@ class StateManager:
         """
         if chat_id in self.monitoring_configs:
             del self.monitoring_configs[chat_id]
+            
+            # Invalidate cache
+            asyncio.create_task(self.invalidate_monitoring_cache())
+            
             self.logger.debug(f"Deleted monitoring config for {chat_id}")
             return True
         return False
@@ -565,6 +586,37 @@ class StateManager:
             if config.enabled
         ]
     
+    # Cached Data Access Methods
+    
+    async def get_cached_monitoring_configs(self, ttl: int = 60) -> List[MonitoringConfig]:
+        """
+        Get monitoring configurations with caching
+        
+        Args:
+            ttl: Cache TTL in seconds
+            
+        Returns:
+            List of MonitoringConfig
+        """
+        cache_key = "all_configs"
+        
+        # Try cache first
+        cached = await self.cache_manager.get("monitoring_configs", cache_key)
+        if cached is not None:
+            return cached
+        
+        # Get from storage
+        configs = self.get_all_monitoring_configs()
+        
+        # Cache result
+        await self.cache_manager.set("monitoring_configs", cache_key, configs, ttl=ttl)
+        
+        return configs
+    
+    async def invalidate_monitoring_cache(self) -> None:
+        """Invalidate monitoring configuration cache"""
+        await self.cache_manager.invalidate_namespace("monitoring_configs")
+    
     # Cleanup and Maintenance
     
     async def start_cleanup_task(self) -> None:
@@ -574,6 +626,10 @@ class StateManager:
             return
         
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        
+        # Start cache cleanup task
+        await self.cache_manager.start_cleanup_task()
+        
         self.logger.info("Started cleanup task")
     
     async def stop_cleanup_task(self) -> None:
@@ -586,6 +642,9 @@ class StateManager:
             await self._cleanup_task
         except asyncio.CancelledError:
             pass
+        
+        # Stop cache cleanup task
+        await self.cache_manager.stop_cleanup_task()
         
         self._cleanup_task = None
         self.logger.info("Stopped cleanup task")
