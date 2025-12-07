@@ -31,4 +31,4 @@ export ENABLE_LOG_ROTATION=false
 echo -e "${YELLOW}Development mode: DEBUG logging enabled${NC}"
 
 # Start the bot
-python panel/bot.py
+python run.py

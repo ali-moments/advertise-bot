@@ -184,13 +184,13 @@ class SendingHandler:
             await query.edit_message_text(
                 text=SEND_MENU_TEXT,
                 reply_markup=keyboard,
-                parse_mode='Markdown'
+                
             )
         else:
             await update.message.reply_text(
                 text=SEND_MENU_TEXT,
                 reply_markup=keyboard,
-                parse_mode='Markdown'
+                
             )
         
         return SELECT_SEND_TYPE
@@ -217,7 +217,7 @@ class SendingHandler:
         # Prompt for CSV upload
         await query.edit_message_text(
             text=SEND_CSV_PROMPT,
-            parse_mode='Markdown'
+            
         )
         
         return UPLOAD_CSV
@@ -243,7 +243,7 @@ class SendingHandler:
         # Prompt for CSV upload
         await query.edit_message_text(
             text=SEND_CSV_PROMPT,
-            parse_mode='Markdown'
+            
         )
         
         return UPLOAD_CSV
@@ -269,7 +269,7 @@ class SendingHandler:
         # Prompt for CSV upload
         await query.edit_message_text(
             text=SEND_CSV_PROMPT,
-            parse_mode='Markdown'
+            
         )
         
         return UPLOAD_CSV
@@ -295,7 +295,7 @@ class SendingHandler:
         # Prompt for CSV upload
         await query.edit_message_text(
             text=SEND_CSV_PROMPT,
-            parse_mode='Markdown'
+            
         )
         
         return UPLOAD_CSV
@@ -329,7 +329,7 @@ class SendingHandler:
             if not success:
                 await update.message.reply_text(
                     text=f"❌ **خطا در فایل CSV**\n\n{result}",
-                    parse_mode='Markdown'
+                    
                 )
                 return UPLOAD_CSV
             
@@ -358,7 +358,7 @@ class SendingHandler:
             
             await update.message.reply_text(
                 text=preview_text,
-                parse_mode='Markdown'
+                
             )
             
             # Next step depends on send type
@@ -368,7 +368,7 @@ class SendingHandler:
                 # Prompt for message text
                 await update.message.reply_text(
                     text=SEND_TEXT_PROMPT,
-                    parse_mode='Markdown'
+                    
                 )
                 return GET_MESSAGE_TEXT
             else:
@@ -389,7 +389,7 @@ class SendingHandler:
                 
                 await update.message.reply_text(
                     text=prompt,
-                    parse_mode='Markdown'
+                    
                 )
                 return UPLOAD_MEDIA
         
@@ -422,14 +422,14 @@ class SendingHandler:
             await update.message.reply_text(
                 text="❌ متن پیام بیش از حد طولانی است (حداکثر 4096 کاراکتر).\n\n"
                      f"طول فعلی: {len(message_text)} کاراکتر",
-                parse_mode='Markdown'
+                
             )
             return GET_MESSAGE_TEXT
         
         if not message_text:
             await update.message.reply_text(
                 text="❌ متن پیام نمی‌تواند خالی باشد.",
-                parse_mode='Markdown'
+                
             )
             return GET_MESSAGE_TEXT
         
@@ -445,7 +445,7 @@ class SendingHandler:
         await update.message.reply_text(
             text=SEND_DELAY_PROMPT,
             reply_markup=keyboard,
-            parse_mode='Markdown'
+            
         )
         
         return SET_DELAY
@@ -498,7 +498,7 @@ class SendingHandler:
             if not success:
                 await update.message.reply_text(
                     text=f"❌ **خطا در فایل رسانه**\n\n{result}",
-                    parse_mode='Markdown'
+                    
                 )
                 return UPLOAD_MEDIA
             
@@ -518,7 +518,7 @@ class SendingHandler:
             await update.message.reply_text(
                 text=PROMPT_CAPTION,
                 reply_markup=keyboard,
-                parse_mode='Markdown'
+                
             )
             
             return GET_CAPTION
@@ -552,7 +552,7 @@ class SendingHandler:
             await update.message.reply_text(
                 text="❌ کپشن بیش از حد طولانی است (حداکثر 1024 کاراکتر).\n\n"
                      f"طول فعلی: {len(caption)} کاراکتر",
-                parse_mode='Markdown'
+                
             )
             return GET_CAPTION
         
@@ -568,7 +568,7 @@ class SendingHandler:
         await update.message.reply_text(
             text=SEND_DELAY_PROMPT,
             reply_markup=keyboard,
-            parse_mode='Markdown'
+            
         )
         
         return SET_DELAY
@@ -596,7 +596,7 @@ class SendingHandler:
         await query.edit_message_text(
             text=SEND_DELAY_PROMPT,
             reply_markup=keyboard,
-            parse_mode='Markdown'
+            
         )
         
         return SET_DELAY
@@ -626,7 +626,7 @@ class SendingHandler:
             )
             await query.edit_message_text(
                 text=error_message,
-                parse_mode='Markdown'
+                
             )
             return SET_DELAY
         
@@ -659,7 +659,7 @@ class SendingHandler:
             )
             await update.message.reply_text(
                 text=error_message,
-                parse_mode='Markdown'
+                
             )
             # Preserve session state and allow retry
             return SET_DELAY
@@ -718,7 +718,7 @@ class SendingHandler:
         await query.edit_message_text(
             text=confirm_text,
             reply_markup=keyboard,
-            parse_mode='Markdown'
+            
         )
         
         return CONFIRM_SEND
@@ -766,7 +766,7 @@ class SendingHandler:
         await update.message.reply_text(
             text=confirm_text,
             reply_markup=keyboard,
-            parse_mode='Markdown'
+            
         )
         
         return CONFIRM_SEND
@@ -847,13 +847,13 @@ class SendingHandler:
         # Update initial message
         await query.edit_message_text(
             text=f"⏳ **شروع ارسال پیام**\n\nتعداد گیرندگان: {len(recipients)}",
-            parse_mode='Markdown'
+            
         )
         
         # Create progress tracker
         progress_msg = await query.message.reply_text(
             text="⏳ در حال آماده‌سازی...",
-            parse_mode='Markdown'
+            
         )
         
         tracker = ProgressTracker(
@@ -938,7 +938,7 @@ class SendingHandler:
         # Send detailed report if there were failures
         if batch_result.failure_count > 0:
             report = result_tracker.get_detailed_report()
-            await query.message.reply_text(text=report, parse_mode='Markdown')
+            await query.message.reply_text(text=report, )
         
         # Delete checkpoint on completion
         self._delete_checkpoint(operation_id)
@@ -960,12 +960,12 @@ class SendingHandler:
         
         await query.edit_message_text(
             text=f"⏳ **شروع ارسال تصویر**\n\nتعداد گیرندگان: {len(recipients)}",
-            parse_mode='Markdown'
+            
         )
         
         progress_msg = await query.message.reply_text(
             text="⏳ در حال آماده‌سازی...",
-            parse_mode='Markdown'
+            
         )
         
         tracker = ProgressTracker(
@@ -1054,12 +1054,12 @@ class SendingHandler:
         
         await query.edit_message_text(
             text=f"⏳ **شروع ارسال ویدیو**\n\nتعداد گیرندگان: {len(recipients)}",
-            parse_mode='Markdown'
+            
         )
         
         progress_msg = await query.message.reply_text(
             text="⏳ در حال آماده‌سازی...",
-            parse_mode='Markdown'
+            
         )
         
         tracker = ProgressTracker(
@@ -1145,12 +1145,12 @@ class SendingHandler:
         
         await query.edit_message_text(
             text=f"⏳ **شروع ارسال فایل**\n\nتعداد گیرندگان: {len(recipients)}",
-            parse_mode='Markdown'
+            
         )
         
         progress_msg = await query.message.reply_text(
             text="⏳ در حال آماده‌سازی...",
-            parse_mode='Markdown'
+            
         )
         
         tracker = ProgressTracker(
@@ -1436,7 +1436,7 @@ class SendingHandler:
         if query:
             await query.edit_message_text(
                 text=f"🔄 **ادامه عملیات**\n\nباقیمانده: {len(remaining_recipients)} از {len(recipients)}",
-                parse_mode='Markdown'
+                
             )
     
     async def cancel_send(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1461,7 +1461,7 @@ class SendingHandler:
         
         await query.edit_message_text(
             text="❌ عملیات لغو شد.",
-            parse_mode='Markdown'
+            
         )
         
         return ConversationHandler.END

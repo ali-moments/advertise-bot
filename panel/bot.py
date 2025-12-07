@@ -839,9 +839,20 @@ class TelegramBotPanel:
         # Set up application
         await self.setup()
         
+        # Initialize and start the application
+        await self.application.initialize()
+        await self.application.start()
+        
         # Start polling
         self.logger.info("Bot is now running. Press Ctrl+C to stop.")
-        await self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        await self.application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        
+        # Keep running until interrupted
+        try:
+            # Run forever
+            await asyncio.Event().wait()
+        except (KeyboardInterrupt, SystemExit):
+            pass
     
     async def shutdown(self):
         """
@@ -855,7 +866,10 @@ class TelegramBotPanel:
         
         # Stop application
         if self.application:
+            if self.application.updater and self.application.updater.running:
+                await self.application.updater.stop()
             await self.application.stop()
+            await self.application.shutdown()
         
         self.logger.info("Bot shutdown complete")
 

@@ -53,7 +53,7 @@ fi
 
 # Start the bot
 echo -e "${GREEN}Starting bot...${NC}"
-python panel/bot.py
+python run.py
 
 # If bot exits, show message
 echo -e "${YELLOW}Bot stopped${NC}"
