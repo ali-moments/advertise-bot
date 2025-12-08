@@ -788,19 +788,33 @@ class MonitoringHandler:
             )
             return ConversationHandler.END
         
-        # Start monitoring for each enabled channel
-        started_count = 0
-        failed_channels = []
-        
+        # Prepare all targets for monitoring
+        targets = []
         for config in enabled_configs:
-            try:
-                # Here you would call the session manager to start monitoring
-                # For now, we'll just mark it as started
-                started_count += 1
-                self.logger.info(f"Started monitoring for channel {config.chat_id}")
-            except Exception as e:
-                self.logger.error(f"Failed to start monitoring for {config.chat_id}: {e}")
-                failed_channels.append(config.chat_id)
+            # Convert reactions to proper format for telegram_manager
+            reactions_list = [
+                {'emoji': r['emoji'], 'weight': r['weight']}
+                for r in config.reactions
+            ]
+            
+            targets.append({
+                'chat_id': config.chat_id,
+                'reaction_pool': {
+                    'reactions': reactions_list
+                },
+                'cooldown': config.cooldown
+            })
+        
+        # Call session manager to start monitoring for all channels at once
+        try:
+            await self.session_manager.start_global_monitoring(targets=targets)
+            started_count = len(targets)
+            failed_channels = []
+            self.logger.info(f"Started monitoring for {started_count} channels")
+        except Exception as e:
+            self.logger.error(f"Failed to start global monitoring: {e}")
+            started_count = 0
+            failed_channels = [config.chat_id for config in enabled_configs]
         
         # Format result message
         result_text = f"✅ **مانیتورینگ سراسری شروع شد**\n\n" \
@@ -844,10 +858,15 @@ class MonitoringHandler:
         
         for config in all_configs:
             try:
-                # Here you would call the session manager to stop monitoring
-                # For now, we'll just mark it as stopped
-                stopped_count += 1
-                self.logger.info(f"Stopped monitoring for channel {config.chat_id}")
+                # Call session manager to stop monitoring
+                success = await self.session_manager.stop_global_monitoring()
+                
+                if success:
+                    stopped_count += 1
+                    self.logger.info(f"Stopped monitoring for channel {config.chat_id}")
+                else:
+                    failed_channels.append(config.chat_id)
+                    self.logger.error(f"Failed to stop monitoring for {config.chat_id}")
             except Exception as e:
                 self.logger.error(f"Failed to stop monitoring for {config.chat_id}: {e}")
                 failed_channels.append(config.chat_id)

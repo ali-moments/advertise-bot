@@ -11,7 +11,7 @@ from typing import List, Dict, Optional
 from .config import AppConfig, SessionConfig
 from .manager import TelegramSessionManager
 
-from .constants import APP_ID, APP_HASH, DB_PATH, SESSION_COUNT
+from .constants import API_ID, API_HASH, DB_PATH, SESSION_COUNT
 
 # Setup logging
 logging.basicConfig(
@@ -34,9 +34,9 @@ class TelegramManagerApp:
         """Initialize the application from database"""
         try:
             # Load constants
-            from .constants import APP_ID, APP_HASH, DB_PATH
+            from .constants import API_ID, API_HASH, DB_PATH
             
-            self.logger.info(f"📁 Using APP_ID: {APP_ID}")
+            self.logger.info(f"📁 Using API_ID: {API_ID}")
             
             # Initialize session manager
             self.manager = TelegramSessionManager(

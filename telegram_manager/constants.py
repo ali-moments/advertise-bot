@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Telegram API Configuration
-APP_ID = int(os.getenv('APP_ID', 'YOUR_APP_ID_HERE'))
-APP_HASH = os.getenv('APP_HASH', 'YOUR_APP_HASH_HERE')
+API_ID = int(os.getenv('API_ID', 'YOUR_API_ID_HERE'))
+API_HASH = os.getenv('API_HASH', 'YOUR_API_HASH_HERE')
 
 # Database and Sessions
 DB_PATH = os.getenv('DB_PATH', 'sessions/data.db')
@@ -34,6 +34,6 @@ BLACKLIST_FAILURE_THRESHOLD = int(os.getenv('BLACKLIST_FAILURE_THRESHOLD', '2'))
 BLACKLIST_AUTO_ADD = os.getenv('BLACKLIST_AUTO_ADD', 'true').lower() == 'true'
 
 # Validation
-if not APP_HASH or APP_HASH == 'YOUR_APP_HASH_HERE':
-    raise ValueError("APP_HASH must be set in .env file")
+if not API_HASH or API_HASH == 'YOUR_API_HASH_HERE':
+    raise ValueError("API_HASH must be set in .env file")
 

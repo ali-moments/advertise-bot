@@ -12,8 +12,8 @@ from .config import SessionConfig
 from .database import DatabaseManager
 from .load_balancer import LoadBalancer
 from .constants import (
-    APP_ID, 
-    APP_HASH, 
+    API_ID, 
+    API_HASH, 
     DB_PATH, 
     SESSION_COUNT,
     MAX_CONCURRENT_OPERATIONS,
@@ -163,7 +163,7 @@ class TelegramSessionManager:
                 return {}
             
             # Convert to session configs
-            session_configs = db_manager.convert_to_session_configs(accounts, APP_ID, APP_HASH)
+            session_configs = db_manager.convert_to_session_configs(accounts, API_ID, API_HASH)
             
             # Load sessions using the existing method
             return await self.load_sessions(session_configs)
