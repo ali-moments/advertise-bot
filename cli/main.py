@@ -262,7 +262,9 @@ class TelegramCLI:
                     
                     target = {
                         'chat_id': channel.channel_id,
-                        'reactions': reactions_dict,
+                        'reaction_pool': {
+                            'reactions': reactions_dict
+                        },
                         'cooldown': 1.0  # Default cooldown
                     }
                     monitoring_targets.append(target)

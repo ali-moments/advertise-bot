@@ -31,9 +31,10 @@ venv.bak/
 .env
 
 # Telegram session files
-*.session
+*.session*
 sessions/*.session
 test.session
+
 
 # Data files
 data/
