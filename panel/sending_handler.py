@@ -792,13 +792,13 @@ class SendingHandler:
         
         try:
             if send_type == 'text':
-                await self._execute_text_send(query, user_id, session)
+                await self._execute_text_send(query, user_id, session, context)
             elif send_type == 'image':
-                await self._execute_image_send(query, user_id, session)
+                await self._execute_image_send(query, user_id, session, context)
             elif send_type == 'video':
-                await self._execute_video_send(query, user_id, session)
+                await self._execute_video_send(query, user_id, session, context)
             elif send_type == 'document':
-                await self._execute_document_send(query, user_id, session)
+                await self._execute_document_send(query, user_id, session, context)
             else:
                 await query.edit_message_text("❌ نوع عملیات نامعتبر است.")
                 return ConversationHandler.END
@@ -831,7 +831,7 @@ class SendingHandler:
         return ConversationHandler.END
 
     
-    async def _execute_text_send(self, query, user_id: int, session) -> None:
+    async def _execute_text_send(self, query, user_id: int, session, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Execute text message sending with work distribution and partial failure handling
         
@@ -857,7 +857,7 @@ class SendingHandler:
         )
         
         tracker = ProgressTracker(
-            bot=query.bot,
+            bot=context.bot,
             chat_id=query.message.chat_id,
             message_id=progress_msg.message_id,
             operation_name="ارسال پیام"
@@ -944,7 +944,7 @@ class SendingHandler:
         self._delete_checkpoint(operation_id)
 
     
-    async def _execute_image_send(self, query, user_id: int, session) -> None:
+    async def _execute_image_send(self, query, user_id: int, session, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Execute image message sending
         
@@ -969,7 +969,7 @@ class SendingHandler:
         )
         
         tracker = ProgressTracker(
-            bot=query.bot,
+            bot=context.bot,
             chat_id=query.message.chat_id,
             message_id=progress_msg.message_id,
             operation_name="ارسال تصویر"
@@ -1039,7 +1039,7 @@ class SendingHandler:
         self._delete_checkpoint(operation_id)
 
     
-    async def _execute_video_send(self, query, user_id: int, session) -> None:
+    async def _execute_video_send(self, query, user_id: int, session, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Execute video message sending
         
@@ -1063,7 +1063,7 @@ class SendingHandler:
         )
         
         tracker = ProgressTracker(
-            bot=query.bot,
+            bot=context.bot,
             chat_id=query.message.chat_id,
             message_id=progress_msg.message_id,
             operation_name="ارسال ویدیو"
@@ -1131,7 +1131,7 @@ class SendingHandler:
         self._delete_checkpoint(operation_id)
 
     
-    async def _execute_document_send(self, query, user_id: int, session) -> None:
+    async def _execute_document_send(self, query, user_id: int, session, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Execute document message sending
         
@@ -1154,7 +1154,7 @@ class SendingHandler:
         )
         
         tracker = ProgressTracker(
-            bot=query.bot,
+            bot=context.bot,
             chat_id=query.message.chat_id,
             message_id=progress_msg.message_id,
             operation_name="ارسال فایل"

@@ -114,7 +114,8 @@ class SessionHandler:
                 CallbackQueryHandler(self.list_sessions, pattern='^session:back_to_list$'),
             ],
             name="session_conversation",
-            persistent=False
+            persistent=False,
+            per_message=True
         )
     
     async def show_session_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

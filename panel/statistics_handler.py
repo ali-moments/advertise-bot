@@ -89,7 +89,8 @@ class StatisticsHandler:
                 CallbackQueryHandler(self.handle_back, pattern='^nav:main$'),
             ],
             name="statistics_conversation",
-            persistent=False
+            persistent=False,
+            per_message=True
         )
     
     @admin_only

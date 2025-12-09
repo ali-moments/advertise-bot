@@ -493,11 +493,11 @@ class ScrapingHandler:
         
         try:
             if scrape_type == 'single':
-                await self._execute_single_scrape(query, user_id, session)
+                await self._execute_single_scrape(query, user_id, session, context)
             elif scrape_type == 'bulk':
-                await self._execute_bulk_scrape(query, user_id, session)
+                await self._execute_bulk_scrape(query, user_id, session, context)
             elif scrape_type == 'extract':
-                await self._execute_link_extraction(query, user_id, session)
+                await self._execute_link_extraction(query, user_id, session, context)
             else:
                 await query.edit_message_text("❌ نوع عملیات نامعتبر است.")
                 return ConversationHandler.END
@@ -524,7 +524,8 @@ class ScrapingHandler:
         self,
         query,
         user_id: int,
-        session
+        session,
+        context: ContextTypes.DEFAULT_TYPE
     ):
         """Execute single group scraping"""
         group_identifier = session.get_data('group_identifier')
@@ -542,7 +543,7 @@ class ScrapingHandler:
         )
         
         tracker = ProgressTracker(
-            bot=query.bot,
+            bot=context.bot,
             chat_id=query.message.chat_id,
             message_id=progress_msg.message_id,
             operation_name="اسکرپ گروه"
@@ -568,7 +569,7 @@ class ScrapingHandler:
                 
                 if file_path and os.path.exists(file_path):
                     await self.file_handler.send_file_to_user(
-                        bot=query.bot,
+                        bot=context.bot,
                         chat_id=query.message.chat_id,
                         file_path=file_path,
                         caption=f"✅ اسکرپ تکمیل شد\n\n"
@@ -594,7 +595,8 @@ class ScrapingHandler:
         self,
         query,
         user_id: int,
-        session
+        session,
+        context: ContextTypes.DEFAULT_TYPE
     ):
         """
         Execute bulk group scraping with work distribution and partial failure handling
@@ -615,7 +617,7 @@ class ScrapingHandler:
         )
         
         tracker = ProgressTracker(
-            bot=query.bot,
+            bot=context.bot,
             chat_id=query.message.chat_id,
             message_id=progress_msg.message_id,
             operation_name="اسکرپ گروهی"
@@ -727,7 +729,7 @@ class ScrapingHandler:
             file_path = item.data.get('file_path')
             if file_path and os.path.exists(file_path):
                 await self.file_handler.send_file_to_user(
-                    bot=query.bot,
+                    bot=context.bot,
                     chat_id=query.message.chat_id,
                     file_path=file_path,
                     caption=f"📊 {item.identifier}\nاعضا: {item.data.get('member_count', 0)}"
@@ -744,7 +746,8 @@ class ScrapingHandler:
         self,
         query,
         user_id: int,
-        session
+        session,
+        context: ContextTypes.DEFAULT_TYPE
     ):
         """Execute link extraction from channel"""
         channel_identifier = session.get_data('channel_identifier')
@@ -761,7 +764,7 @@ class ScrapingHandler:
         )
         
         tracker = ProgressTracker(
-            bot=query.bot,
+            bot=context.bot,
             chat_id=query.message.chat_id,
             message_id=progress_msg.message_id,
             operation_name="استخراج لینک"

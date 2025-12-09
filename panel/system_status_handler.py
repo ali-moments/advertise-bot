@@ -75,7 +75,8 @@ class SystemStatusHandler:
                 CallbackQueryHandler(self.handle_back, pattern='^nav:main$'),
             ],
             name="system_status_handler",
-            persistent=False
+            persistent=False,
+            per_message=True
         )
     
     @admin_only

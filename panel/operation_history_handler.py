@@ -727,7 +727,8 @@ class OperationHistoryHandler:
                 )
             ],
             name="operation_history",
-            persistent=False
+            persistent=False,
+            per_message=True
         )
     
     def get_stats(self) -> Dict[str, Any]:
