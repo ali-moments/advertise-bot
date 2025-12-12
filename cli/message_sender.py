@@ -418,11 +418,16 @@ class MessageSenderCLI:
                 # Prompt for message text
                 self.console.print("\n[bold]Enter message text:[/bold]")
                 self.console.print("  - Type your message (press Enter twice to finish)")
+                self.console.print("  - Or type 'file:' followed by path to load from markdown file")
+                self.console.print("  - Example: file:message.md")
+                
+                # Import aioconsole for async input
+                import aioconsole
                 
                 message_lines = []
                 empty_line_count = 0
                 while True:
-                    line = input()
+                    line = await aioconsole.ainput()
                     if not line:
                         empty_line_count += 1
                         if empty_line_count >= 2:
@@ -437,6 +442,21 @@ class MessageSenderCLI:
                     message_lines.pop()
                 
                 message = '\n'.join(message_lines)
+                
+                # Check if user wants to load from file
+                if message.strip().startswith('file:'):
+                    file_path = message.strip()[5:].strip()
+                    if not os.path.exists(file_path):
+                        self.ui.show_error(f"File not found: {file_path}")
+                        return
+                    
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            message = f.read()
+                        self.ui.show_success(f"Loaded message from {file_path} ({len(message)} characters)")
+                    except Exception as e:
+                        self.ui.show_error(f"Error reading file: {e}")
+                        return
                 
                 if not message.strip():
                     self.ui.show_error("Message cannot be empty")

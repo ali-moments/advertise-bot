@@ -608,6 +608,21 @@ class CSVProcessor:
                         for cell in first_row
                     )
                     
+                    # Find preferred column indices if header exists
+                    username_col = None
+                    user_id_col = None
+                    phone_col = None
+                    
+                    if is_header:
+                        for i, cell in enumerate(first_row):
+                            cell_lower = str(cell).strip().lower()
+                            if cell_lower in ['username', 'user']:
+                                username_col = i
+                            elif cell_lower in ['user_id', 'userid', 'id']:
+                                user_id_col = i
+                            elif cell_lower == 'phone':
+                                phone_col = i
+                    
                     # If not a header, process the first row
                     if not is_header:
                         # Extract first non-empty cell as identifier
@@ -620,12 +635,30 @@ class CSVProcessor:
                     # Process remaining rows
                     for row_num, row in enumerate(reader, start=2 if is_header else 1):
                         try:
-                            # Extract first non-empty cell as identifier
-                            for cell in row:
-                                cell_str = str(cell).strip()
-                                if cell_str:
-                                    identifiers.append(cell_str)
-                                    break
+                            if is_header:
+                                # Prefer username > phone > user_id
+                                identifier = None
+                                if username_col is not None and username_col < len(row):
+                                    identifier = str(row[username_col]).strip()
+                                    # Add @ prefix if not present for usernames
+                                    if identifier and not identifier.startswith('@'):
+                                        identifier = '@' + identifier
+                                
+                                if not identifier and phone_col is not None and phone_col < len(row):
+                                    identifier = str(row[phone_col]).strip()
+                                
+                                if not identifier and user_id_col is not None and user_id_col < len(row):
+                                    identifier = str(row[user_id_col]).strip()
+                                
+                                if identifier:
+                                    identifiers.append(identifier)
+                            else:
+                                # Extract first non-empty cell as identifier
+                                for cell in row:
+                                    cell_str = str(cell).strip()
+                                    if cell_str:
+                                        identifiers.append(cell_str)
+                                        break
                         except Exception as e:
                             # Log malformed row but continue processing
                             print(f'Warning: Malformed CSV row {row_num}: {e}')
