@@ -158,6 +158,7 @@ class TelegramSession:
         self.api_hash = api_hash
         self.client: Optional[TelegramClient] = None
         self.is_connected = False
+        self._is_corrupted = False  # Track if session is corrupted
         
         # Monitoring system
         self.monitoring_targets: Dict[str, MonitoringTarget] = {}
@@ -634,8 +635,35 @@ class TelegramSession:
         """
         try:
             self.client = TelegramClient(self.session_file, self.api_id, self.api_hash)
-            await self.client.start()
-            self.is_connected = True
+            
+            # Try to start with timeout - skip if requires login
+            try:
+                await asyncio.wait_for(
+                    self.client.start(
+                        phone=lambda: None,  # Don't prompt for phone
+                        code_callback=lambda: None,  # Don't prompt for code
+                        password=lambda: None  # Don't prompt for password
+                    ),
+                    timeout=10.0  # 10 second timeout
+                )
+                self.is_connected = True
+            except asyncio.TimeoutError:
+                self.logger.warning(f"⏭️ Skipping session {self.session_file} - login required or timeout")
+                if self.client:
+                    await self.client.disconnect()
+                return False
+            except Exception as login_error:
+                error_msg = str(login_error)
+                if "authorization key" in error_msg and "simultaneously" in error_msg:
+                    self.logger.warning(f"🗑️ Session {self.session_file} is corrupted (used from different IPs) - marking for removal")
+                    # Mark session as corrupted for removal
+                    self._is_corrupted = True
+                else:
+                    self.logger.warning(f"⏭️ Skipping session {self.session_file} - login error: {login_error}")
+                
+                if self.client:
+                    await self.client.disconnect()
+                return False
             
             # Start queue processor
             self.queue_processor_task = self._create_task(
@@ -646,7 +674,8 @@ class TelegramSession:
             self.logger.info("✅ Successfully connected to Telegram")
             return True
         except Exception as e:
-            self.logger.error(f"❌ Connection failed: {e}")
+            # This should not happen if inner try-catch works properly
+            self.logger.error(f"❌ Unexpected connection error: {e}")
             return False
 
     async def disconnect(self):

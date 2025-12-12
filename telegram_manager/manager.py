@@ -4,6 +4,7 @@ TelegramSessionManager class - Multi-session management
 
 import asyncio
 import logging
+import os
 import random
 import time
 from typing import List, Dict, Optional, Callable
@@ -204,6 +205,19 @@ class TelegramSessionManager:
                     results[config.name] = True
                     self.logger.info(f"✅ Loaded session: {config.name}")
                 else:
+                    # Check if session is corrupted and should be removed
+                    if hasattr(session, '_is_corrupted') and session._is_corrupted:
+                        self.logger.warning(f"🗑️ Removing corrupted session file: {config.session_file}")
+                        try:
+                            if os.path.exists(config.session_file):
+                                os.remove(config.session_file)
+                            # Also remove .session-journal if it exists
+                            journal_file = config.session_file + "-journal"
+                            if os.path.exists(journal_file):
+                                os.remove(journal_file)
+                        except Exception as remove_error:
+                            self.logger.error(f"❌ Failed to remove corrupted session file: {remove_error}")
+                    
                     results[config.name] = False
                     self.logger.error(f"❌ Failed to load session: {config.name}")
                     
